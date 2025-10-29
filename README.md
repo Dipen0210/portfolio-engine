@@ -19,15 +19,6 @@ It integrates:
 
 ---
 
-## 🏗️ Architecture
-
-
----
-
-## ⚙️ Core Layers
-
----
-
 ## ⚙️ Core Layers
 
 | Stage | Layer / Module | Purpose / Task | Input | Output | Models / Techniques Used |
