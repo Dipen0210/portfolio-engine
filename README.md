@@ -28,8 +28,8 @@ It integrates:
 
 | Stage | Layer / Module | Purpose / Task | Input | Output | Models / Techniques Used | Status |
 |-------|----------------|----------------|--------|---------|--------------------------|---------|
-| 1️⃣ | **User Input Layer** | Collect user preferences | Sectors, capital, (optional) risk level | Structured user profile | — | ✅ Done via Streamlit |
-| 2️⃣ | **Data Layer** | Fetch & preprocess OHLCV | Tickers, company.csv | Clean price data | yfinance API | ✅ Ready |
+| 1️⃣ | **User Input Layer** | Collect user preferences | Sectors, capital, (optional) risk level | Structured user profile | 
+| 2️⃣ | **Data Layer** | Fetch & preprocess OHLCV | Tickers, company.csv | Clean price data | yfinance API 
 | 3️⃣ | **Hard Filter Layer** | Reduce universe (sector, market cap) | User input | Filtered stock universe | Basic filters | ✅ Done |
 | 4️⃣ | **Strategy Layer** | Rank & select best stocks | Filtered universe | Ranked list | Momentum, Value, etc. | ✅ Done |
 | 5️⃣ | **Forecasting Layer** | Estimate expected returns | Price history | μ (expected returns) | Rolling mean, CAPM | ✅ Done |
