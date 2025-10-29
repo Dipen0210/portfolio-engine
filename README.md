@@ -26,29 +26,25 @@ It integrates:
 
 ## ⚙️ Core Layers
 
-| Stage | Layer / Module | Purpose / Task | Input | Output | Models / Techniques Used |
-|-------|----------------|----------------|--------|---------|--------------------------|---------|
-| 1️⃣ | **User Input Layer** | Collect user preferences | Sectors, capital, (optional) risk level | Structured user profile | 
-| 2️⃣ | **Data Layer** | Fetch & preprocess OHLCV | Tickers, company.csv | Clean price data | yfinance API |
-| 3️⃣ | **Hard Filter Layer** | Reduce universe (sector, market cap) | User input | Filtered stock universe | Basic filters | ✅ Done |
-| 4️⃣ | **Strategy Layer** | Rank & select best stocks | Filtered universe | Ranked list | Momentum, Value, etc. | ✅ Done |
-| 5️⃣ | **Forecasting Layer** | Estimate expected returns | Price history | μ (expected returns) | Rolling mean, CAPM | ✅ Done |
-| 6️⃣ | **Portfolio Construction** | Build base portfolios | Ranked stocks + μ + Σ | Candidate portfolios | MVO, Utility Theory | ✅ Done |
-| 7️⃣ | **Optimization Layer** | Find optimal weights | μ, Σ, constraints | Optimal weights | Markowitz, Convex Opt | ✅ Done |
-| 8️⃣ | **Risk Management** | Evaluate & control risk | Portfolio weights | Risk metrics | VaR, CVaR, Beta, Vol | ✅ Done |
-| 9️⃣ | **Stress Testing** | Test portfolio robustness | Portfolio + shocks | Stress results | Historical + Monte Carlo | ✅ Done |
-| 🔟 | **Backtesting** | Evaluate historical performance | Portfolio weights | Equity curve | Rolling simulation | 🔜 Next |
-| 11️⃣ | **Signal Generation** | Generate buy/sell signals | Optimized portfolio | Trade signals | Rebalance-driven logic | 🔜 Planned |
-| 12️⃣ | **Execution** | Simulate or execute trades | Signals | Trade log | Paper trading / APIs | ⚙️ Optional |
-| 13️⃣ | **Performance Layer** | Track and explain results | Portfolio history | Sharpe, Sortino, Alpha | Visualization | 🔜 Next |
-| 14️⃣ | **Rebalancing** | Maintain target weights | Current vs target | Updated portfolio | Automated loop | ✅ Done |
-
 ---
 
-## 🚀 Quick Start
+## ⚙️ Core Layers
 
-### 1️⃣ Clone the Repository
-```bash
-git clone https://github.com/<your-username>/smallQ.git
-cd smallQ
+| Stage | Layer / Module | Purpose / Task | Input | Output | Models / Techniques Used |
+|-------|----------------|----------------|--------|---------|--------------------------|
+| 1️⃣ | **User Input Layer** | Collect user preferences | Sectors, capital, (optional) risk level | Structured user profile | — |
+| 2️⃣ | **Data Layer** | Fetch & preprocess OHLCV | Tickers, company.csv | Clean price data | yfinance API |
+| 3️⃣ | **Hard Filter Layer** | Reduce universe (sector, market cap) | User input | Filtered stock universe | Basic filters |
+| 4️⃣ | **Strategy Layer** | Rank & select best stocks | Filtered universe | Ranked list | Momentum, Value, etc. |
+| 5️⃣ | **Forecasting Layer** | Estimate expected returns | Price history | μ (expected returns) | Rolling mean, CAPM |
+| 6️⃣ | **Portfolio Construction** | Build base portfolios | Ranked stocks + μ + Σ | Candidate portfolios | MVO, Utility Theory |
+| 7️⃣ | **Optimization Layer** | Find optimal weights | μ, Σ, constraints | Optimal weights | Markowitz, Convex Opt |
+| 8️⃣ | **Risk Management** | Evaluate & control risk | Portfolio weights | Risk metrics | VaR, CVaR, Beta, Vol |
+| 9️⃣ | **Stress Testing** | Test portfolio robustness | Portfolio + shocks | Stress results | Historical + Monte Carlo |
+| 🔟 | **Backtesting** | Evaluate historical performance | Portfolio weights | Equity curve | Rolling simulation |
+| 11️⃣ | **Signal Generation** | Generate buy/sell signals | Optimized portfolio | Trade signals | Rebalance-driven logic |
+| 12️⃣ | **Execution** | Simulate or execute trades | Signals | Trade log | Paper trading / APIs |
+| 13️⃣ | **Performance Layer** | Track and explain results | Portfolio history | Sharpe, Sortino, Alpha | Visualization |
+| 14️⃣ | **Rebalancing** | Maintain target weights | Current vs target | Updated portfolio | Automated loop |
 
+---
