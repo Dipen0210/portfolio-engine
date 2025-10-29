@@ -1,0 +1,19 @@
+# Data
+yfinance
+pandas
+numpy
+
+# Visualization
+matplotlib
+seaborn
+
+# Backtesting + Finance
+scipy
+scikit-learn
+
+# Dashboard
+streamlit
+plotly
+
+# Utility
+tqdm

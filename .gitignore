@@ -1,0 +1,16 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+logs/
+streamlit.log
+*.sqlite3
+.env
+venv/
+env/
+.venv/
+build/
+dist/
+*.egg-info/
