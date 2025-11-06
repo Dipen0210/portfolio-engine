@@ -255,7 +255,7 @@ if run_button:
                 alloc_display["Weight"] = alloc_display["Weight"].round(4)
             desired_order = ["Date", "Ticker", "Weight"]
             alloc_display = alloc_display[[col for col in desired_order if col in alloc_display.columns] + [c for c in alloc_display.columns if c not in desired_order]]
-            st.dataframe(alloc_display)
+            st.dataframe(alloc_display.reset_index(drop=True), hide_index=True)
             st.caption("Allocation as of the selected date. Weights sum to 100% across active holdings.")
             if {"Ticker", "Weight"}.issubset(alloc_display.columns):
                 pie_source = (
@@ -278,7 +278,7 @@ if run_button:
         if candidate_pool.empty:
             st.warning("No stocks passed the hard filters. Consider broadening your criteria.")
         else:
-            st.dataframe(candidate_pool)
+            st.dataframe(candidate_pool.reset_index(drop=True), hide_index=True)
             top_n_display = int(candidate_pool.groupby("sector").size().max())
             st.caption(f"Displayed: Top {top_n_display} per sector based on risk-adjusted market cap filter.")
 
@@ -295,7 +295,7 @@ if run_button:
             )
             if "Strategy_Score" in winners_df.columns:
                 winners_df["Strategy_Score"] = winners_df["Strategy_Score"].astype(float).round(4)
-            st.dataframe(winners_df)
+            st.dataframe(winners_df.reset_index(drop=True), hide_index=True)
             st.caption("These top-ranked tickers will flow into the forecasting layer for further analysis.")
 
         if forecast_exclusions:
@@ -309,7 +309,10 @@ if run_button:
         if expected_returns_df is None or expected_returns_df.empty:
             st.info("Not enough price history to compute expected returns for the selected winners.")
         else:
-            st.dataframe(expected_returns_df.sort_values("Expected_Return", ascending=False).reset_index(drop=True))
+            st.dataframe(
+                expected_returns_df.sort_values("Expected_Return", ascending=False).reset_index(drop=True),
+                hide_index=True,
+            )
             if strategy_lookback:
                 st.caption(
                     f"Expected returns rely on the strategy-defined lookback window (~{int(strategy_lookback)} days) when sufficient price history exists."
@@ -325,7 +328,7 @@ if run_button:
             opt_df = optimized_weights.rename("Opt_Weight").reset_index().rename(columns={"index": "Ticker"})
             opt_df["Opt_Weight"] = opt_df["Opt_Weight"].round(4)
             st.markdown("**Mean-Variance Optimized Weights**")
-            st.dataframe(opt_df)
+            st.dataframe(opt_df.reset_index(drop=True), hide_index=True)
 
         if hybrid_allocation is not None and not hybrid_allocation.empty:
             hybrid_display = hybrid_allocation.copy()
@@ -333,7 +336,7 @@ if run_button:
             hybrid_display["Rank_Weight"] = hybrid_display["Rank_Weight"].round(4)
             hybrid_display["Opt_Weight"] = hybrid_display["Opt_Weight"].round(4)
             st.markdown("**Blended Allocation (Rank vs. Optimizer)**")
-            st.dataframe(hybrid_display)
+            st.dataframe(hybrid_display.reset_index(drop=True), hide_index=True)
             st.caption("Final weights blend rank-based intuition with mean-variance optimization.")
 
         st.divider()
@@ -369,31 +372,136 @@ if run_button:
             )
 
         st.divider()
+        backtest_curve = backtest_results.get("portfolio") if backtest_results else None
+        backtest_metrics = backtest_results.get("metrics", {}) if backtest_results else {}
+        benchmark_curve = backtest_results.get("benchmark") if backtest_results else None
+        benchmark_metrics = backtest_results.get("benchmark_metrics", {}) if backtest_results else {}
+        backtest_summary = backtest_results.get("summary", {}) if backtest_results else {}
+        rebalance_count = backtest_results.get("rebalance_count", 0) if backtest_results else 0
+        rebalance_dates = backtest_results.get("rebalance_dates", []) if backtest_results else []
+        transactions_df = backtest_results.get("transactions") if backtest_results else pd.DataFrame()
+        holdings_df = backtest_results.get("holdings") if backtest_results else pd.DataFrame()
+        backtest_available = backtest_results is not None
+
+        def _fmt_dollar(value):
+            return "N/A" if value is None or pd.isna(value) else f"${value:,.2f}"
+
+        def _fmt_pct(value):
+            return "N/A" if value is None or pd.isna(value) else f"{value * 100:.2f}%"
+
+        invested_amt = backtest_summary.get("initial_capital")
+        final_amt = backtest_summary.get("final_value")
+        ret_amt = backtest_summary.get("return_amount")
+        ret_pct = backtest_summary.get("return_pct")
+
+        summary_start = backtest_summary.get("start_date")
+        summary_end = backtest_summary.get("end_date")
+        summary_start_label = pd.to_datetime(summary_start).strftime("%Y-%m-%d") if summary_start is not None else "-"
+        summary_end_label = pd.to_datetime(summary_end).strftime("%Y-%m-%d") if summary_end is not None else "-"
+
+        st.write("### 📬 Trade Signals")
+        if trade_signals is None or trade_signals.empty:
+            st.info("No trade signals generated. Portfolio unchanged.")
+        else:
+            signals_display = trade_signals.copy()
+            if "Old_Weight" in signals_display.columns:
+                signals_display["Old_Weight"] = (
+                    pd.to_numeric(signals_display["Old_Weight"], errors="coerce").round(4)
+                )
+            if "New_Weight" in signals_display.columns:
+                signals_display["New_Weight"] = (
+                    pd.to_numeric(signals_display["New_Weight"], errors="coerce").round(4)
+                )
+                st.dataframe(signals_display, hide_index=True)
+            st.caption(
+                f"{len(signals_display)} trade instructions generated using a {drift_threshold:.1%} drift threshold."
+            )
+
+        st.divider()
+        st.write("### 🧾 Trade Log History")
+        if trade_log is None or trade_log.empty:
+            st.info("Trade log is empty. Run at least one rebalance cycle.")
+        else:
+            log_display = trade_log.copy()
+            if "Old_Weight" in log_display.columns:
+                log_display["Old_Weight"] = (
+                    pd.to_numeric(log_display["Old_Weight"], errors="coerce").round(4)
+                )
+            if "New_Weight" in log_display.columns:
+                log_display["New_Weight"] = (
+                    pd.to_numeric(log_display["New_Weight"], errors="coerce").round(4)
+                )
+            desired_log_order = ["Date", "Ticker", "Signal", "Old_Weight", "New_Weight", "Reason", "Timestamp"]
+            log_display = log_display[[col for col in desired_log_order if col in log_display.columns]]
+            st.dataframe(log_display.tail(100).reset_index(drop=True), hide_index=True)
+            st.caption("Most recent 100 trade entries from the session log.")
+
+        st.divider()
+        st.write("### 🔁 Backtest Transactions")
+        if transactions_df is None or transactions_df.empty:
+            st.info("No backtest transactions available.")
+        else:
+            display_tx = transactions_df.copy()
+            numeric_cols = [
+                "Net_Weight",
+                "Shares",
+                "Price",
+                "TradeValue",
+                "CashFlow",
+                "Transaction Cost",
+            ]
+            for col in numeric_cols:
+                if col in display_tx.columns:
+                    display_tx[col] = (
+                        pd.to_numeric(display_tx[col], errors="coerce").round(4)
+                    )
+            display_tx = display_tx.rename(columns={"Net_Weight": "Net weight"})
+            display_tx["Date"] = pd.to_datetime(display_tx["Date"]).dt.strftime("%Y-%m-%d")
+            column_order = [
+                "Date",
+                "Ticker",
+                "Signal",
+                "Action",
+                "Net weight",
+                "Reason",
+                "Shares",
+                "Price",
+                "TradeValue",
+                "Transaction Cost",
+                "CashFlow",
+            ]
+            display_tx = display_tx[
+                [c for c in column_order if c in display_tx.columns]
+            ]
+            st.dataframe(display_tx, hide_index=True)
+            st.caption(
+                f"{len(display_tx)} trades recorded across the backtest window. Positive CashFlow reflects capital returned to cash."
+            )
+
+        st.divider()
+        st.write("### 📂 Open Backtest Holdings")
+        holdings_columns = ["Ticker", "Shares", "Price", "MarketValue"]
+        if holdings_df is None or holdings_df.empty:
+            st.info("No open holdings at the end of the backtest window.")
+        else:
+            holdings_display = holdings_df.copy()
+            for col in ["Shares", "Price", "MarketValue"]:
+                if col in holdings_display.columns:
+                    holdings_display[col] = (
+                        pd.to_numeric(holdings_display[col], errors="coerce")
+                    ).round(6 if col != "MarketValue" else 4)
+            holdings_display = holdings_display.reindex(columns=holdings_columns)
+            st.dataframe(holdings_display, hide_index=True)
+            holdings_label = summary_end_label if summary_end_label != "-" else "final backtest date"
+            st.caption(f"Mark-to-market holdings as of {holdings_label}.")
+
+        st.divider()
         st.write(f"### 🔄 Backtest ({rebalance_choice} Rebalance)")
-        if not backtest_results:
+        if not backtest_available:
             st.info(
                 "Backtest unavailable. Ensure sufficient price history and weights, then rerun."
             )
         else:
-            backtest_curve = backtest_results.get("portfolio")
-            backtest_metrics = backtest_results.get("metrics", {})
-            benchmark_curve = backtest_results.get("benchmark")
-            benchmark_metrics = backtest_results.get("benchmark_metrics", {})
-            backtest_summary = backtest_results.get("summary", {})
-            rebalance_count = backtest_results.get("rebalance_count", 0)
-            rebalance_dates = backtest_results.get("rebalance_dates", [])
-            transactions_df = backtest_results.get("transactions")
-
-            def _fmt_dollar(value):
-                return "N/A" if value is None or pd.isna(value) else f"${value:,.2f}"
-
-            def _fmt_pct(value):
-                return "N/A" if value is None or pd.isna(value) else f"{value * 100:.2f}%"
-
-            invested_amt = backtest_summary.get("initial_capital")
-            final_amt = backtest_summary.get("final_value")
-            ret_amt = backtest_summary.get("return_amount")
-            ret_pct = backtest_summary.get("return_pct")
             backtest_summary_cols = st.columns(5)
             backtest_summary_cols[0].metric("Invested", _fmt_dollar(invested_amt))
             backtest_summary_cols[1].metric("Final Value", _fmt_dollar(final_amt))
@@ -401,13 +509,9 @@ if run_button:
             backtest_summary_cols[3].metric("Return %", _fmt_pct(ret_pct))
             backtest_summary_cols[4].metric("Rebalances", str(int(rebalance_count)))
 
-            summary_start = backtest_summary.get("start_date")
-            summary_end = backtest_summary.get("end_date")
-            summary_start_label = pd.to_datetime(summary_start).strftime("%Y-%m-%d") if summary_start is not None else "-"
-            summary_end_label = pd.to_datetime(summary_end).strftime("%Y-%m-%d") if summary_end is not None else "-"
             if rebalance_count == 0:
                 st.caption(
-                    f"No scheduled rebalances executed; portfolio liquidated on {summary_end_label}."
+                    "No scheduled rebalances executed; holdings carried throughout the window."
                 )
             elif rebalance_dates:
                 formatted_rebalance_dates = [
@@ -416,6 +520,11 @@ if run_button:
                 st.caption(
                     "Rebalances executed on: " + ", ".join(formatted_rebalance_dates)
                 )
+            calendar_notes = [
+                note for note in backtest_summary.get("calendar_notes", []) if note
+            ]
+            if calendar_notes:
+                st.caption("Calendar adjustments: " + " | ".join(calendar_notes))
 
             if backtest_curve is not None and not backtest_curve.empty:
                 chart_df = backtest_curve.copy()
@@ -468,75 +577,7 @@ if run_button:
                 metrics_df = pd.DataFrame(metrics_data)
                 st.table(metrics_df)
 
-            if transactions_df is not None and not transactions_df.empty:
-                st.divider()
-                st.write("### 🔁 Backtest Transactions")
-                display_tx = transactions_df.copy()
-                numeric_cols = ["Shares", "Price", "TradeValue", "CashFlow", "Transaction Cost"]
-                for col in numeric_cols:
-                    if col in display_tx.columns:
-                        display_tx[col] = (
-                            pd.to_numeric(display_tx[col], errors="coerce").round(4)
-                        )
-                display_tx["Date"] = pd.to_datetime(display_tx["Date"]).dt.strftime(
-                    "%Y-%m-%d"
-                )
-                column_order = [
-                    "Date",
-                    "Event",
-                    "Ticker",
-                    "Action",
-                    "Shares",
-                    "Price",
-                    "TradeValue",
-                    "Transaction Cost",
-                    "CashFlow",
-                ]
-                display_tx = display_tx[
-                    [c for c in column_order if c in display_tx.columns]
-                ]
-                st.dataframe(display_tx)
-                st.caption(
-                    f"{len(display_tx)} trades recorded across the backtest window. Positive CashFlow reflects capital returned to cash."
-                )
-
-        st.divider()
-        st.write("### 📬 Trade Signals")
-        if trade_signals is None or trade_signals.empty:
-            st.info("No trade signals generated. Portfolio unchanged.")
-        else:
-            signals_display = trade_signals.copy()
-            if "Old_Weight" in signals_display.columns:
-                signals_display["Old_Weight"] = (
-                    pd.to_numeric(signals_display["Old_Weight"], errors="coerce").round(4)
-                )
-            if "New_Weight" in signals_display.columns:
-                signals_display["New_Weight"] = (
-                    pd.to_numeric(signals_display["New_Weight"], errors="coerce").round(4)
-                )
-            st.dataframe(signals_display)
-            st.caption(
-                f"{len(signals_display)} trade instructions generated using a {drift_threshold:.1%} drift threshold."
-            )
-
-        if trade_log is not None and not trade_log.empty:
-            st.divider()
-            st.write("### 🧾 Trade Log History")
-            log_display = trade_log.copy()
-            if "Old_Weight" in log_display.columns:
-                log_display["Old_Weight"] = (
-                    pd.to_numeric(log_display["Old_Weight"], errors="coerce").round(4)
-                )
-            if "New_Weight" in log_display.columns:
-                log_display["New_Weight"] = (
-                    pd.to_numeric(log_display["New_Weight"], errors="coerce").round(4)
-                )
-            desired_log_order = ["Date", "Ticker", "Signal", "Old_Weight", "New_Weight", "Reason", "Timestamp"]
-            log_display = log_display[[col for col in desired_log_order if col in log_display.columns]]
-            st.dataframe(log_display.tail(100))
-            st.caption("Most recent 100 trade entries from the session log.")
-
-else:
-    st.info(
-        "👈 Configure inputs in the sidebar and click **Run Rebalance Cycle** to start."
-    )
+    else:
+        st.info(
+            "👈 Configure inputs in the sidebar and click **Run Rebalance Cycle** to start."
+        )

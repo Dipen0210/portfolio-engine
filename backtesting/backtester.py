@@ -28,6 +28,7 @@ def _prepare_close_series(df: pd.DataFrame, ticker: str) -> pd.Series | None:
 def backtest_portfolio(
     price_data_dict,
     weights_df: pd.DataFrame,
+    trade_log_df: pd.DataFrame | None = None,
     rebalance_freq: str = "M",
     initial_capital: float = 100000,
     benchmark_df: pd.DataFrame | None = None,
@@ -42,7 +43,11 @@ def backtest_portfolio(
     price_data_dict : dict[str, pd.DataFrame]
         Mapping of ticker to OHLCV DataFrame (must include 'Close').
     weights_df : pd.DataFrame
-        Optimised weights with columns ['Ticker', 'Weight'].
+        Optimised weights with columns ['Ticker', 'Weight'] or snapshot history
+        with optional 'Date' column.
+    trade_log_df : pd.DataFrame, optional
+        Trade signal log used for annotating transactions (Date, Ticker, Signal,
+        Old_Weight, New_Weight, Reason, Timestamp).
     rebalance_freq : str, optional
         Pandas offset alias marking rebalance cadence (default 'M').
     initial_capital : float, optional
@@ -64,18 +69,96 @@ def backtest_portfolio(
     if weights_df.empty:
         raise ValueError("Backtest failed: no weights provided for simulation.")
 
-    weights = (
-        weights_df.set_index("Ticker")["Weight"]
-        .astype(float)
+    if "Weight" not in weights_df.columns:
+        raise ValueError("Backtest failed: weights DataFrame must include a 'Weight' column.")
+
+    working_weights = weights_df.copy()
+    working_weights["Weight"] = (
+        pd.to_numeric(working_weights["Weight"], errors="coerce")
         .replace([np.inf, -np.inf], np.nan)
-        .dropna()
     )
-    weights = weights[weights > 0]
-    if weights.empty:
-        raise ValueError("Backtest failed: weights must contain positive allocations.")
+    working_weights = working_weights.dropna(subset=["Weight"])
+    if working_weights.empty:
+        raise ValueError("Backtest failed: weights must contain valid numeric allocations.")
+
+    has_dated_weights = "Date" in working_weights.columns
+    weight_snapshots: list[dict] = []
+
+    if has_dated_weights:
+        working_weights["Date"] = pd.to_datetime(working_weights["Date"], errors="coerce")
+        if "OriginalDate" in working_weights.columns:
+            working_weights["OriginalDate"] = pd.to_datetime(
+                working_weights["OriginalDate"], errors="coerce"
+            )
+            working_weights.loc[
+                working_weights["OriginalDate"].isna(), "OriginalDate"
+            ] = working_weights.loc[working_weights["OriginalDate"].isna(), "Date"]
+        else:
+            working_weights["OriginalDate"] = working_weights["Date"]
+
+        working_weights["Date"] = working_weights["Date"].dt.normalize()
+        working_weights = working_weights.dropna(subset=["Date"])
+        if working_weights.empty:
+            raise ValueError("Backtest failed: dated weights have invalid timestamps.")
+        for dt, group in working_weights.groupby("Date", sort=True):
+            series = (
+                group.set_index("Ticker")["Weight"]
+                .astype(float)
+                .replace([np.inf, -np.inf], np.nan)
+                .dropna()
+            )
+            series = series[series > 0]
+            if not series.empty:
+                original_series = pd.to_datetime(group["OriginalDate"], errors="coerce").dropna()
+                original_ts = original_series.iloc[-1] if not original_series.empty else pd.Timestamp(dt)
+                weight_snapshots.append(
+                    {
+                        "requested_date": pd.Timestamp(dt),
+                        "original_date": pd.Timestamp(original_ts),
+                        "weights": series,
+                    }
+                )
+        if not weight_snapshots:
+            raise ValueError("Backtest failed: no usable weight snapshots after filtering.")
+    else:
+        series = (
+            working_weights.set_index("Ticker")["Weight"]
+            .astype(float)
+            .replace([np.inf, -np.inf], np.nan)
+            .dropna()
+        )
+        series = series[series > 0]
+        if series.empty:
+            raise ValueError("Backtest failed: weights must contain positive allocations.")
+        weight_snapshots.append(
+            {
+                "requested_date": None,
+                "original_date": None,
+                "weights": series,
+            }
+        )
+
+    all_tickers = sorted({ticker for snap in weight_snapshots for ticker in snap["weights"].index})
+    if not all_tickers:
+        raise ValueError("Backtest failed: no tickers found in the supplied weights.")
+
+    trade_log_lookup = None
+    if trade_log_df is not None and not trade_log_df.empty:
+        log_work = trade_log_df.copy()
+        log_work["Date"] = pd.to_datetime(log_work["Date"], errors="coerce")
+        log_work = log_work.dropna(subset=["Date"])
+        log_work["Ticker"] = log_work["Ticker"].astype(str)
+        if "Timestamp" in log_work.columns:
+            log_work["Timestamp"] = pd.to_datetime(log_work["Timestamp"], errors="coerce")
+        else:
+            log_work["Timestamp"] = log_work["Date"]
+        log_work["LookupDate"] = log_work["Date"].dt.normalize()
+        log_work = log_work.dropna(subset=["LookupDate", "Ticker"])
+        log_work = log_work.sort_values(["LookupDate", "Ticker", "Timestamp"])
+        trade_log_lookup = log_work.groupby(["LookupDate", "Ticker"]).last()
 
     close_series = []
-    for ticker in weights.index:
+    for ticker in all_tickers:
         df = price_data_dict.get(ticker)
         if df is None or df.empty:
             continue
@@ -110,13 +193,11 @@ def backtest_portfolio(
     close_prices = close_prices.loc[window_mask]
     close_prices = close_prices.ffill().dropna()
 
-    available_tickers = [t for t in weights.index if t in close_prices.columns]
+    available_tickers = [t for t in close_prices.columns if t in all_tickers]
     if not available_tickers:
         raise ValueError("Backtest failed: no overlapping price history within the selected window.")
 
     close_prices = close_prices[available_tickers]
-    weights = weights.reindex(available_tickers)
-    weights = weights / weights.sum()
 
     trading_days = close_prices.index
     if len(trading_days) == 0:
@@ -131,9 +212,63 @@ def backtest_portfolio(
             return None
         return trading_days[loc]
 
-    schedule = [trading_days[0]]
+    snapshot_schedule_map: dict[pd.Timestamp, dict] = {}
+    calendar_notes: list[str] = []
+    for snap in weight_snapshots:
+        weights_series = snap["weights"]
+        requested_date = snap.get("requested_date")
+        original_ts = snap.get("original_date")
+
+        if requested_date is None:
+            aligned_date = trading_days[0]
+            normalized_requested = aligned_date
+        else:
+            candidate = pd.Timestamp(requested_date)
+            normalized_requested = candidate.normalize()
+            aligned_date = _align_to_trading_day(candidate)
+            if aligned_date is None:
+                aligned_date = _align_to_trading_day(normalized_requested)
+            if aligned_date is None:
+                continue
+
+        reindexed = weights_series.reindex(available_tickers).fillna(0.0)
+        total_weight = reindexed.sum()
+        if total_weight <= 0:
+            continue
+
+        holiday_note = None
+        if requested_date is not None and aligned_date.normalize() != normalized_requested.normalize():
+            holiday_note = (
+                f"Signal dated {normalized_requested.date()} executed on next trading day {aligned_date.date()}."
+            )
+            calendar_notes.append(holiday_note)
+
+        snapshot_schedule_map[aligned_date] = {
+            "weights": (reindexed / total_weight),
+            "requested_date": requested_date,
+            "original_date": original_ts if original_ts is not None else aligned_date,
+            "holiday_note": holiday_note,
+        }
+
+    snapshot_schedule = [
+        {"aligned_date": date, **meta}
+        for date, meta in sorted(snapshot_schedule_map.items())
+        if date in trading_days
+    ]
+    if not snapshot_schedule:
+        raise ValueError("Backtest failed: no valid weight snapshots aligned to trading calendar.")
+
+    first_snapshot_day = snapshot_schedule[0]["aligned_date"]
+    if trading_days[0] < first_snapshot_day:
+        close_prices = close_prices.loc[close_prices.index >= first_snapshot_day]
+        trading_days = close_prices.index
+        if len(trading_days) == 0:
+            raise ValueError("Backtest failed: insufficient price history after aligning to weight snapshots.")
+
     rebalance_rule = (rebalance_freq or "").strip().upper()
-    if rebalance_rule:
+    rebalance_candidate_set: set[pd.Timestamp] = set()
+    if not has_dated_weights and rebalance_rule:
+        schedule = [trading_days[0]]
         raw_schedule = pd.date_range(
             start=trading_days[0],
             end=trading_days[-1],
@@ -143,96 +278,187 @@ def backtest_portfolio(
             aligned = _align_to_trading_day(candidate)
             if aligned is not None and aligned != schedule[-1]:
                 schedule.append(aligned)
-    rebalance_candidates = schedule[1:]
-    rebalance_candidate_set = set(rebalance_candidates)
+        rebalance_candidate_set = set(schedule[1:])
 
-    holdings = pd.Series(0.0, index=weights.index)
+    holdings = pd.Series(0.0, index=close_prices.columns, dtype=float)
+    cash_balance = float(initial_capital)
     transactions: list[dict] = []
     portfolio_records: list[dict] = []
     executed_rebalance_dates: list[pd.Timestamp] = []
 
-    for idx, day in enumerate(trading_days):
+    prev_target_weights = pd.Series(0.0, index=holdings.index, dtype=float)
+    current_target_weights: pd.Series | None = None
+    next_snapshot_idx = 0
+
+    for day in trading_days:
         prices = close_prices.loc[day]
 
-        if idx == 0:
-            for ticker, weight in weights.items():
+        weight_update_today = False
+        plan_old_weights = prev_target_weights.copy()
+        plan_new_weights = current_target_weights.copy() if current_target_weights is not None else None
+        schedule_meta_today = None
+        holiday_note_today: str | None = None
+
+        if next_snapshot_idx < len(snapshot_schedule) and day == snapshot_schedule[next_snapshot_idx]["aligned_date"]:
+            weight_update_today = True
+            schedule_meta_today = snapshot_schedule[next_snapshot_idx]
+            plan_old_weights = current_target_weights.copy() if current_target_weights is not None else prev_target_weights.copy()
+            current_target_weights = schedule_meta_today["weights"].copy()
+            plan_new_weights = current_target_weights.copy()
+            holiday_note_today = schedule_meta_today.get("holiday_note")
+            next_snapshot_idx += 1
+
+        if current_target_weights is None:
+            # No weights available yet; skip until first allocation snapshot.
+            portfolio_value = float((holdings * prices).sum() + cash_balance)
+            portfolio_records.append({"Date": day, "Portfolio Value": portfolio_value})
+            continue
+
+        should_rebalance_today = False
+        event_label = None
+        if weight_update_today:
+            should_rebalance_today = True
+            event_label = (
+                "Initial Allocation"
+                if plan_old_weights.sum() <= 1e-12
+                else "Allocation Update"
+            )
+        elif day in rebalance_candidate_set:
+            should_rebalance_today = True
+            event_label = "Scheduled Rebalance"
+
+        base_value = float((holdings * prices).sum() + cash_balance)
+
+        if holiday_note_today:
+            transactions.append(
+                {
+                    "Date": day,
+                    "Event": "Calendar Adjustment",
+                    "Ticker": "-",
+                    "Action": "HOLD",
+                    "Signal": "HOLD",
+                    "Shares": 0.0,
+                    "Price": 0.0,
+                    "TradeValue": 0.0,
+                    "CashFlow": 0.0,
+                    "Old_Weight": 0.0,
+                    "New_Weight": 0.0,
+                    "Net_Weight": 0.0,
+                    "Reason": holiday_note_today,
+                    "Timestamp": schedule_meta_today.get("original_date") if schedule_meta_today else pd.NaT,
+                }
+            )
+
+        if should_rebalance_today and plan_new_weights is not None and base_value > 0:
+            day_cash_flow = 0.0
+            trades_executed = False
+            plan_old_aligned = plan_old_weights.reindex(holdings.index, fill_value=0.0)
+            plan_new_aligned = plan_new_weights.reindex(holdings.index, fill_value=0.0)
+            for ticker in holdings.index:
                 price = prices[ticker]
                 if pd.isna(price) or price <= 0:
                     continue
-                allocation_value = initial_capital * weight
-                shares = allocation_value / price if price else 0.0
-                holdings.at[ticker] = shares
-                trade_value = shares * price
+                target_weight = float(plan_new_aligned.at[ticker])
+                target_value = base_value * target_weight
+                target_shares = target_value / price if price else 0.0
+                old_shares = holdings.at[ticker]
+                delta_shares = target_shares - old_shares
+                if abs(delta_shares) <= 1e-9:
+                    continue
+                shares_traded = abs(delta_shares)
+                action = "BUY" if delta_shares > 0 else "SELL"
+                trade_value = shares_traded * price
+                cash_flow = -trade_value if action == "BUY" else trade_value
+                day_cash_flow += cash_flow
+                actual_old_weight = (old_shares * price) / base_value if base_value > 0 else 0.0
+
+                if weight_update_today:
+                    old_weight_plan = float(plan_old_aligned.at[ticker])
+                    prev_plan_sum = plan_old_aligned.sum()
+                    if prev_plan_sum <= 1e-12:
+                        signal = "BUY"
+                        reason = "Initial portfolio allocation"
+                    elif old_weight_plan <= 1e-12 and target_weight > 0:
+                        signal = "BUY"
+                        reason = "Newly added to optimized portfolio"
+                    elif target_weight <= 1e-12 and old_weight_plan > 0:
+                        signal = "SELL"
+                        reason = "Removed from new optimized portfolio"
+                    else:
+                        drift = abs(target_weight - old_weight_plan) / old_weight_plan if old_weight_plan > 0 else 0.0
+                        signal = "REBALANCE"
+                        reason = f"Weight drifted by {drift:.2%}"
+                    old_weight_to_log = old_weight_plan
+                else:
+                    signal = "REBALANCE"
+                    comparison_base = actual_old_weight if actual_old_weight > 0 else target_weight
+                    if comparison_base > 0:
+                        drift = abs(target_weight - actual_old_weight) / comparison_base
+                    else:
+                        drift = float("inf")
+                    reason = (
+                        f"Weight drifted by {drift:.2%}"
+                        if np.isfinite(drift)
+                        else "Weight reset during rebalance"
+                    )
+                    old_weight_to_log = actual_old_weight
+
+                recorded_signal = signal
+                recorded_reason = reason
+                recorded_old_weight = float(old_weight_to_log)
+                recorded_new_weight = float(target_weight)
+                recorded_timestamp = None
+                log_entry = None
+                if trade_log_lookup is not None:
+                    day_key = pd.Timestamp(day).normalize()
+                    try:
+                        log_entry = trade_log_lookup.loc[(day_key, str(ticker))]
+                    except KeyError:
+                        log_entry = None
+                if log_entry is not None:
+                    if isinstance(log_entry, pd.DataFrame):
+                        log_entry = log_entry.iloc[-1]
+                    if "Signal" in log_entry and pd.notna(log_entry["Signal"]):
+                        recorded_signal = str(log_entry["Signal"])
+                    if "Reason" in log_entry and pd.notna(log_entry["Reason"]):
+                        recorded_reason = log_entry["Reason"]
+                    if "Old_Weight" in log_entry and pd.notna(log_entry["Old_Weight"]):
+                        recorded_old_weight = float(log_entry["Old_Weight"])
+                    if "New_Weight" in log_entry and pd.notna(log_entry["New_Weight"]):
+                        recorded_new_weight = float(log_entry["New_Weight"])
+                    if "Timestamp" in log_entry and pd.notna(log_entry["Timestamp"]):
+                        recorded_timestamp = pd.to_datetime(log_entry["Timestamp"])
+
                 transactions.append(
                     {
                         "Date": day,
-                        "Event": "Initial Allocation",
+                        "Event": event_label or "Rebalance",
                         "Ticker": ticker,
-                        "Action": "BUY",
-                        "Shares": shares,
+                        "Action": action,
+                        "Signal": recorded_signal,
+                        "Shares": shares_traded,
                         "Price": price,
                         "TradeValue": trade_value,
-                        "CashFlow": -trade_value,
+                        "CashFlow": cash_flow,
+                        "Old_Weight": recorded_old_weight,
+                        "New_Weight": recorded_new_weight,
+                        "Net_Weight": recorded_new_weight - recorded_old_weight,
+                        "Reason": recorded_reason,
+                        "Timestamp": recorded_timestamp,
                     }
                 )
-        elif day in rebalance_candidate_set:
-            portfolio_value = float((holdings * prices).sum())
-            trades_executed = False
-            for ticker, weight in weights.items():
-                price = prices[ticker]
-                if pd.isna(price) or price <= 0:
-                    continue
-                target_value = portfolio_value * weight
-                target_shares = target_value / price if price else 0.0
-                delta_shares = target_shares - holdings.at[ticker]
-                if abs(delta_shares) > 1e-9:
-                    trades_executed = True
-                    action = "BUY" if delta_shares > 0 else "SELL"
-                    trade_value = abs(delta_shares) * price
-                    cash_flow = -trade_value if delta_shares > 0 else trade_value
-                    transactions.append(
-                        {
-                            "Date": day,
-                            "Event": "Scheduled Rebalance",
-                            "Ticker": ticker,
-                            "Action": action,
-                            "Shares": delta_shares,
-                            "Price": price,
-                            "TradeValue": trade_value,
-                            "CashFlow": cash_flow,
-                        }
-                    )
                 holdings.at[ticker] = target_shares
+                trades_executed = True
+
             if trades_executed:
+                cash_balance += day_cash_flow
                 executed_rebalance_dates.append(day)
 
-        portfolio_value = float((holdings * prices).sum())
-        portfolio_records.append(
-            {
-                "Date": day,
-                "Portfolio Value": portfolio_value,
-            }
-        )
+        if weight_update_today and current_target_weights is not None:
+            prev_target_weights = current_target_weights.copy()
 
-    final_day = trading_days[-1]
-    final_prices = close_prices.loc[final_day]
-    for ticker, shares in holdings.items():
-        if abs(shares) > 1e-9:
-            price = final_prices[ticker]
-            trade_value = abs(shares) * price
-            transactions.append(
-                {
-                    "Date": final_day,
-                    "Event": "Final Liquidation",
-                    "Ticker": ticker,
-                    "Action": "SELL",
-                    "Shares": -shares,
-                    "Price": price,
-                    "TradeValue": trade_value,
-                    "CashFlow": trade_value,
-                }
-            )
-            holdings.at[ticker] = 0.0
+        portfolio_value = float((holdings * prices).sum() + cash_balance)
+        portfolio_records.append({"Date": day, "Portfolio Value": portfolio_value})
 
     portfolio_df = pd.DataFrame(portfolio_records).set_index("Date")
     portfolio_df.index = pd.to_datetime(portfolio_df.index)
@@ -263,13 +489,48 @@ def backtest_portfolio(
     transactions_df = pd.DataFrame(transactions)
     if not transactions_df.empty:
         transactions_df["Date"] = pd.to_datetime(transactions_df["Date"])
-        for col in ["Shares", "Price", "TradeValue", "CashFlow"]:
+        for col in ["Shares", "Price", "TradeValue", "CashFlow", "Old_Weight", "New_Weight", "Net_Weight"]:
             transactions_df[col] = pd.to_numeric(transactions_df[col], errors="coerce")
+        if "Timestamp" in transactions_df.columns:
+            transactions_df["Timestamp"] = pd.to_datetime(transactions_df["Timestamp"])
         transactions_df["Transaction Cost"] = (
             transactions_df["TradeValue"].abs() - transactions_df["CashFlow"].abs()
         )
         transactions_df["Transaction Cost"] = transactions_df["Transaction Cost"].round(4)
         transactions_df = transactions_df.sort_values(["Date", "Event", "Ticker"]).reset_index(drop=True)
+
+    final_day = trading_days[-1]
+    final_prices = close_prices.loc[final_day]
+    holdings_snapshot = (
+        holdings[holdings.abs() > 1e-9]
+        .to_frame(name="Shares")
+        .reset_index()
+        .rename(columns={"index": "Ticker"})
+    )
+    if not holdings_snapshot.empty:
+        holdings_snapshot["Price"] = holdings_snapshot["Ticker"].map(final_prices)
+        holdings_snapshot = holdings_snapshot.dropna(subset=["Price"])
+        holdings_snapshot["MarketValue"] = holdings_snapshot["Shares"] * holdings_snapshot["Price"]
+        holdings_snapshot["Shares"] = holdings_snapshot["Shares"].round(6)
+        holdings_snapshot["Price"] = holdings_snapshot["Price"].round(6)
+        holdings_snapshot["MarketValue"] = holdings_snapshot["MarketValue"].round(4)
+    else:
+        holdings_snapshot = pd.DataFrame(columns=["Ticker", "Shares", "Price", "MarketValue"])
+    if abs(cash_balance) > 1e-6:
+        cash_row = pd.DataFrame(
+            [
+                {
+                    "Ticker": "CASH",
+                    "Shares": np.nan,
+                    "Price": np.nan,
+                    "MarketValue": round(float(cash_balance), 4),
+                }
+            ]
+        )
+        holdings_snapshot = pd.concat([holdings_snapshot, cash_row], ignore_index=True)
+    holdings_snapshot = holdings_snapshot.reindex(columns=["Ticker", "Shares", "Price", "MarketValue"])
+
+    calendar_notes = list(dict.fromkeys(calendar_notes))
 
     summary = {
         "initial_capital": float(initial_capital),
@@ -279,6 +540,8 @@ def backtest_portfolio(
         "rebalance_count": len(executed_rebalance_dates),
         "start_date": portfolio_df.index[0],
         "end_date": portfolio_df.index[-1],
+        "ending_cash": float(cash_balance),
+        "calendar_notes": calendar_notes,
     }
 
     return {
@@ -290,4 +553,5 @@ def backtest_portfolio(
         "rebalance_dates": executed_rebalance_dates,
         "rebalance_count": len(executed_rebalance_dates),
         "summary": summary,
+        "holdings": holdings_snapshot,
     }

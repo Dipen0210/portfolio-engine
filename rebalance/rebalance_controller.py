@@ -174,14 +174,14 @@ def run_rebalance_cycle(
     price_history = fetch_stock_data(
         unique_tickers,
         start_date=start_dt - timedelta(days=5),
-        end_date=end_dt,
+        end_date=end_dt + timedelta(days=1),
     )
     missing_tickers = [t for t in unique_tickers if t not in price_history]
 
     benchmark_history = fetch_stock_data(
         [BENCHMARK_TICKER],
         start_date=start_dt - timedelta(days=5),
-        end_date=end_dt,
+        end_date=end_dt + timedelta(days=1),
     )
     benchmark_df = benchmark_history.get(BENCHMARK_TICKER)
 
@@ -338,7 +338,79 @@ def run_rebalance_cycle(
             except Exception:
                 risk_report = None
 
-        if weights_for_risk is not None and not weights_for_risk.empty:
+        if "Date" not in new_allocation.columns:
+            new_allocation = new_allocation.copy()
+            new_allocation["Date"] = end_dt.strftime("%Y-%m-%d")
+
+        try:
+            trade_signals = generate_portfolio_signals(
+                previous_allocation,
+                new_allocation,
+                drift_threshold=drift_threshold,
+                as_of_date=end_dt,
+            )
+        except Exception:
+            trade_signals = None
+
+        state.last_allocation = new_allocation.copy()
+        if trade_signals is not None and not trade_signals.empty:
+            try:
+                state.signal_log = pd.concat(
+                    [state.signal_log, trade_signals], ignore_index=True
+                )
+            except Exception:
+                pass
+        trade_log_df = getattr(state, "signal_log", pd.DataFrame()).copy()
+        if backtest_results is None and not trade_log_df.empty:
+            weight_history = (
+                trade_log_df.loc[:, ["Date", "Ticker", "New_Weight"]]
+                .rename(columns={"New_Weight": "Weight"})
+            )
+            weight_history["Date"] = pd.to_datetime(weight_history["Date"], errors="coerce")
+            weight_history["Weight"] = pd.to_numeric(weight_history["Weight"], errors="coerce")
+            weight_history = weight_history.dropna(subset=["Date", "Ticker", "Weight"])
+            if not weight_history.empty:
+                weight_history["OriginalDate"] = weight_history["Date"]
+                weight_history["Date"] = weight_history["Date"].dt.normalize()
+                weight_history = (
+                    weight_history.sort_values(["Date", "Ticker", "OriginalDate"])
+                    .groupby(["Date", "Ticker"], as_index=False)
+                    .last()
+                )
+                weight_history["Ticker"] = weight_history["Ticker"].astype(str)
+                if backtest_start_dt is not None:
+                    weight_history = weight_history[
+                        weight_history["Date"] >= pd.Timestamp(backtest_start_dt)
+                    ]
+                if end_dt is not None:
+                    weight_history = weight_history[
+                        weight_history["Date"] <= pd.Timestamp(end_dt)
+                    ]
+                ticker_universe = weight_history["Ticker"].unique().tolist()
+                backtest_price_history = {
+                    ticker: price_history[ticker]
+                    for ticker in ticker_universe
+                    if ticker in price_history
+                }
+                if backtest_price_history:
+                    try:
+                        backtest_results = backtest_portfolio(
+                            backtest_price_history,
+                            weight_history,
+                            trade_log_df=trade_log_df,
+                            rebalance_freq=backtest_rebalance_freq,
+                            initial_capital=capital,
+                            benchmark_df=benchmark_df,
+                            start_date=backtest_start_dt,
+                            end_date=end_dt,
+                        )
+                    except Exception:
+                        backtest_results = None
+        if (
+            backtest_results is None
+            and weights_for_risk is not None
+            and not weights_for_risk.empty
+        ):
             weights_df = (
                 weights_for_risk.rename("Weight")
                 .reset_index()
@@ -362,28 +434,39 @@ def run_rebalance_cycle(
                     )
                 except Exception:
                     backtest_results = None
-        if "Date" not in new_allocation.columns:
-            new_allocation = new_allocation.copy()
-            new_allocation["Date"] = end_dt.strftime("%Y-%m-%d")
-
-        try:
-            trade_signals = generate_portfolio_signals(
-                previous_allocation,
-                new_allocation,
-                drift_threshold=drift_threshold,
-                as_of_date=end_dt,
-            )
-        except Exception:
-            trade_signals = None
-
-        state.last_allocation = new_allocation.copy()
-        if trade_signals is not None and not trade_signals.empty:
-            try:
-                state.signal_log = pd.concat(
-                    [state.signal_log, trade_signals], ignore_index=True
+        if backtest_results is None and new_allocation is not None and not new_allocation.empty:
+            candidate_allocation = new_allocation.copy()
+            if "Date" not in candidate_allocation.columns:
+                candidate_allocation["Date"] = end_dt.strftime("%Y-%m-%d")
+            candidate_allocation["Date"] = pd.to_datetime(candidate_allocation["Date"], errors="coerce")
+            candidate_allocation["Weight"] = pd.to_numeric(candidate_allocation["Weight"], errors="coerce")
+            candidate_allocation = candidate_allocation.dropna(subset=["Date", "Ticker", "Weight"])
+            if not candidate_allocation.empty:
+                candidate_allocation = (
+                    candidate_allocation.sort_values(["Date", "Ticker"])
+                    .groupby(["Date", "Ticker"], as_index=False)
+                    .last()
                 )
-            except Exception:
-                pass
+                ticker_universe = candidate_allocation["Ticker"].unique().tolist()
+                backtest_price_history = {
+                    ticker: price_history[ticker]
+                    for ticker in ticker_universe
+                    if ticker in price_history
+                }
+                if backtest_price_history:
+                    try:
+                        backtest_results = backtest_portfolio(
+                            backtest_price_history,
+                            candidate_allocation,
+                            trade_log_df=trade_log_df if not trade_log_df.empty else None,
+                            rebalance_freq=backtest_rebalance_freq,
+                            initial_capital=capital,
+                            benchmark_df=benchmark_df,
+                            start_date=backtest_start_dt,
+                            end_date=end_dt,
+                        )
+                    except Exception:
+                        backtest_results = None
 
     if "Date" not in new_allocation.columns:
         new_allocation = new_allocation.copy()
