@@ -40,16 +40,37 @@ def generate_portfolio_signals(
         Columns: ['Ticker', 'Signal', 'Old_Weight', 'New_Weight', 'Reason']
     """
 
+    def _prepare_portfolio(df: pd.DataFrame | None) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["Ticker", "Weight"])
+        working = df.copy()
+        if "Ticker" not in working.columns or "Weight" not in working.columns:
+            return pd.DataFrame(columns=["Ticker", "Weight"])
+        working["Ticker"] = working["Ticker"].astype(str).str.strip()
+        working = working[working["Ticker"] != ""]
+        working["Weight"] = pd.to_numeric(working["Weight"], errors="coerce")
+        working = working.dropna(subset=["Weight"])
+        if "CarryForward" in working.columns:
+            working = working.drop(columns=["CarryForward"])
+        working = (
+            working.sort_values(["Ticker"])
+            .groupby("Ticker", as_index=False, sort=False)
+            .last()
+        )
+        return working[["Ticker", "Weight"]]
+
     results = []
     date_str = _normalize_date(as_of_date)
 
-    old_tickers = set(old_portfolio_df['Ticker']
-                      ) if old_portfolio_df is not None else set()
-    new_tickers = set(new_portfolio_df['Ticker'])
+    prepared_old = _prepare_portfolio(old_portfolio_df)
+    prepared_new = _prepare_portfolio(new_portfolio_df)
+
+    old_tickers = set(prepared_old["Ticker"])
+    new_tickers = set(prepared_new["Ticker"])
 
     # 1️⃣ Initial entry (first portfolio → BUY all)
     if not old_tickers:
-        for _, row in new_portfolio_df.iterrows():
+        for _, row in prepared_new.iterrows():
             results.append({
                 "Ticker": row['Ticker'],
                 "Signal": "BUY",
@@ -63,17 +84,44 @@ def generate_portfolio_signals(
         return signals_df
 
     # Convert to dicts for quick lookup
-    old_weights = dict(
-        zip(old_portfolio_df['Ticker'], old_portfolio_df['Weight']))
-    new_weights = dict(
-        zip(new_portfolio_df['Ticker'], new_portfolio_df['Weight']))
+    old_weights = dict(zip(prepared_old['Ticker'], prepared_old['Weight']))
+    new_weights = dict(zip(prepared_new['Ticker'], prepared_new['Weight']))
+
+    tolerance = 1e-6
+
+    if not new_tickers and old_tickers:
+        for ticker in sorted(old_tickers):
+            old_w = old_weights.get(ticker, 0.0)
+            results.append({
+                "Ticker": ticker,
+                "Signal": "HOLD",
+                "Old_Weight": old_w,
+                "New_Weight": old_w,
+                "Reason": "Allocation carried forward (no updated weights available)",
+                "Date": date_str,
+            })
+        signals_df = pd.DataFrame(results)
+        signals_df["Timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_signals(signals_df)
+        return signals_df
 
     # 2️⃣ SELL – stocks removed from portfolio
     for ticker in old_tickers - new_tickers:
+        old_w = old_weights.get(ticker, 0.0)
+        if abs(old_w) <= tolerance:
+            results.append({
+                "Ticker": ticker,
+                "Signal": "HOLD",
+                "Old_Weight": old_w,
+                "New_Weight": old_w,
+                "Reason": "Position weight unchanged within tolerance",
+                "Date": date_str,
+            })
+            continue
         results.append({
             "Ticker": ticker,
             "Signal": "SELL",
-            "Old_Weight": old_weights.get(ticker, 0),
+            "Old_Weight": old_w,
             "New_Weight": 0,
             "Reason": "Removed from new optimized portfolio",
             "Date": date_str,
@@ -94,7 +142,19 @@ def generate_portfolio_signals(
     for ticker in old_tickers & new_tickers:
         old_w = old_weights[ticker]
         new_w = new_weights[ticker]
-        drift = abs(new_w - old_w) / old_w if old_w > 0 else 1.0
+        delta = abs(new_w - old_w)
+        if delta <= tolerance:
+            results.append({
+                "Ticker": ticker,
+                "Signal": "HOLD",
+                "Old_Weight": old_w,
+                "New_Weight": new_w,
+                "Reason": "Allocation unchanged",
+                "Date": date_str,
+            })
+            continue
+
+        drift = abs(new_w - old_w) / old_w if abs(old_w) > tolerance else float("inf")
 
         if drift > drift_threshold:
             results.append({

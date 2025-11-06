@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from pandas.tseries.holiday import USFederalHolidayCalendar
 
 from execution.portfolio_state import PortfolioState
 from hardfilters.data_utils import load_company_universe
@@ -88,40 +89,86 @@ def _compute_next_rebalance(base_dt: datetime, freq_code: str) -> datetime:
     return next_ts.to_pydatetime()
 
 
-def _adjust_to_trading_day(target_dt: datetime) -> datetime:
-    adjusted = target_dt
-    while adjusted.weekday() >= 5:
-        adjusted -= timedelta(days=1)
-    return adjusted
+US_HOLIDAY_CAL = USFederalHolidayCalendar()
+
+
+def _is_us_business_day(ts: pd.Timestamp) -> bool:
+    ts = ts.normalize()
+    if ts.weekday() >= 5:
+        return False
+    return ts not in US_HOLIDAY_CAL.holidays(start=ts, end=ts)
+
+
+def _next_trading_day(target_dt: datetime) -> datetime:
+    dt = pd.Timestamp(target_dt).normalize()
+    guard = 0
+    while not _is_us_business_day(dt):
+        dt += timedelta(days=1)
+        guard += 1
+        if guard > 366:
+            raise ValueError("Unable to resolve the next trading day within one year.")
+    return dt.to_pydatetime()
+
+
+def _previous_trading_day(target_dt: datetime) -> datetime:
+    dt = pd.Timestamp(target_dt).normalize() - timedelta(days=1)
+    guard = 0
+    while not _is_us_business_day(dt):
+        dt -= timedelta(days=1)
+        guard += 1
+        if guard > 366:
+            raise ValueError("Unable to resolve the previous trading day within one year.")
+    return dt.to_pydatetime()
 
 
 sectors_token = "-".join(sorted(sectors)) if sectors else "all"
-adjusted_start_date = _adjust_to_trading_day(as_of_date)
+execution_date = _next_trading_day(as_of_date)
+try:
+    analysis_date = _previous_trading_day(execution_date)
+except ValueError:
+    analysis_date = execution_date
+
+if execution_date.date() != as_of_date.date():
+    st.info(
+        f"Selected date {as_of_date.strftime('%Y-%m-%d')} is not a trading day. "
+        f"Trades will execute on {execution_date.strftime('%Y-%m-%d')} at the market open."
+    )
+st.caption(
+    f"Calculations use market data through {analysis_date.strftime('%Y-%m-%d')} (previous trading close)."
+)
+
 timeline_config = (
-    f"{adjusted_start_date.strftime('%Y-%m-%d')}_{rebalance_code}_{strategy}_{risk_level}_{capital}_{drift_threshold:.4f}_{sectors_token}"
+    f"{analysis_date.strftime('%Y-%m-%d')}_{execution_date.strftime('%Y-%m-%d')}_"
+    f"{rebalance_code}_{strategy}_{risk_level}_{capital}_{drift_threshold:.4f}_{sectors_token}"
 )
 timeline_state = st.session_state.get("rebalance_timeline")
 if timeline_state is None or timeline_state.get("config") != timeline_config:
     st.session_state["rebalance_timeline"] = {
         "config": timeline_config,
-        "start_date": adjusted_start_date.strftime("%Y-%m-%d"),
+        "analysis_anchor": analysis_date.strftime("%Y-%m-%d"),
+        "execution_anchor": execution_date.strftime("%Y-%m-%d"),
         "last_rebalance": None,
     }
     st.session_state["portfolio_state"] = PortfolioState(cash=capital)
 timeline_state = st.session_state["rebalance_timeline"]
-start_date_preview = datetime.strptime(timeline_state["start_date"], "%Y-%m-%d")
+if "analysis_anchor" not in timeline_state or "execution_anchor" not in timeline_state:
+    timeline_state["analysis_anchor"] = analysis_date.strftime("%Y-%m-%d")
+    timeline_state["execution_anchor"] = execution_date.strftime("%Y-%m-%d")
+    st.session_state["rebalance_timeline"] = timeline_state
+analysis_anchor = datetime.strptime(timeline_state["analysis_anchor"], "%Y-%m-%d")
+execution_anchor = datetime.strptime(timeline_state["execution_anchor"], "%Y-%m-%d")
 last_rebalance_preview = timeline_state.get("last_rebalance")
 if last_rebalance_preview:
     preview_base = datetime.strptime(last_rebalance_preview, "%Y-%m-%d")
     next_candidate = _compute_next_rebalance(preview_base, rebalance_code)
 else:
     preview_base = None
-    next_candidate = start_date_preview
-next_preview = _adjust_to_trading_day(next_candidate)
-if next_preview > datetime.today():
-    next_label = next_preview.strftime("%Y-%m-%d") + " (awaiting data)"
+    next_candidate = execution_anchor
+next_preview_execution = _next_trading_day(next_candidate)
+if next_preview_execution > datetime.today():
+    next_label = next_preview_execution.strftime("%Y-%m-%d") + " (awaiting data)"
 else:
-    next_label = next_preview.strftime("%Y-%m-%d")
+    next_label = next_preview_execution.strftime("%Y-%m-%d")
 last_label = last_rebalance_preview or "None yet"
 st.sidebar.caption(
     f"Last rebalance: {last_label} · Next scheduled: {next_label}"
@@ -132,7 +179,7 @@ if "portfolio_state" not in st.session_state:
 
 if st.sidebar.button("Reset Portfolio State"):
     st.session_state["portfolio_state"] = PortfolioState(cash=capital)
-    st.experimental_rerun()
+    st.rerun()
 
 run_button = st.sidebar.button("🚀 Run Rebalance Cycle")
 
@@ -146,7 +193,8 @@ if run_button:
     state = st.session_state["portfolio_state"]
     state.cash = capital
 
-    start_date = datetime.strptime(timeline_state["start_date"], "%Y-%m-%d")
+    analysis_anchor_dt = analysis_anchor
+    execution_anchor_dt = execution_anchor
     last_rebalance_str = timeline_state.get("last_rebalance")
     last_rebalance = (
         datetime.strptime(last_rebalance_str, "%Y-%m-%d")
@@ -155,16 +203,20 @@ if run_button:
     )
     results = None
     if last_rebalance is None:
-        target_candidate = start_date
+        target_execution = execution_anchor_dt
     else:
         target_candidate = _compute_next_rebalance(last_rebalance, rebalance_code)
-    target_date = _adjust_to_trading_day(target_candidate)
+        target_execution = _next_trading_day(target_candidate)
+    try:
+        target_analysis = _previous_trading_day(target_execution)
+    except ValueError:
+        target_analysis = target_execution
     today = datetime.today()
-    if target_date > today:
+    if target_execution > today:
         st.warning(
             "Next rebalance date exceeds available market data. Try again later."
         )
-    elif last_rebalance and target_date <= last_rebalance:
+    elif last_rebalance and target_execution <= last_rebalance:
         st.warning("No new trading days to process for the selected frequency.")
     else:
         try:
@@ -175,19 +227,22 @@ if run_button:
                 user_sectors=sectors,
                 risk_level=risk_level,
                 capital=capital,
-                as_of_date=target_date,
-                backtest_start_date=start_date,
-                backtest_end_date=target_date,
+                as_of_date=target_analysis,
+                execution_date=target_execution,
+                backtest_start_date=analysis_anchor_dt,
+                backtest_end_date=target_execution,
                 backtest_rebalance_freq=rebalance_code,
                 drift_threshold=drift_threshold,
             )
         except ValueError as exc:
             st.error(str(exc))
         else:
-            timeline_state["last_rebalance"] = target_date.strftime("%Y-%m-%d")
+            timeline_state["last_rebalance"] = target_execution.strftime("%Y-%m-%d")
+            timeline_state["analysis_anchor"] = target_analysis.strftime("%Y-%m-%d")
+            timeline_state["execution_anchor"] = target_execution.strftime("%Y-%m-%d")
             st.session_state["rebalance_timeline"] = timeline_state
             st.success(
-                f"Rebalance executed on {target_date.strftime('%Y-%m-%d')}."
+                f"Rebalance executed on {target_execution.strftime('%Y-%m-%d')}."
             )
 
     if results is not None:
@@ -200,10 +255,21 @@ if run_button:
         hybrid_allocation = results.get("hybrid_allocation")
         risk_report = results.get("risk_report")
         backtest_results = results.get("backtest_results")
+        backtest_error = results.get("backtest_error")
+        allocation_carried = results.get("carried_forward_allocation", False)
         trade_signals = results.get("trade_signals")
         current_allocation = results.get("current_allocation")
         trade_log = results.get("trade_log")
-        result_as_of = results.get("as_of_date", target_date)
+        execution_used = results.get("execution_date", target_execution)
+        if execution_used is not None:
+            execution_label = pd.to_datetime(execution_used).strftime("%Y-%m-%d")
+        else:
+            execution_label = "-"
+        analysis_used = results.get("analysis_date")
+        if analysis_used is not None:
+            analysis_label = pd.to_datetime(analysis_used).strftime("%Y-%m-%d")
+        else:
+            analysis_label = "-"
         strategy_start_label = "-"
         strategy_start_dt = results.get("strategy_start_date")
         if strategy_start_dt is not None:
@@ -217,33 +283,46 @@ if run_button:
                 "%Y-%m-%d"
             )
         backtest_end_label = "-"
-        backtest_end_dt = results.get("end_date", target_date)
+        backtest_end_dt = results.get("end_date", execution_used)
         if backtest_end_dt is not None:
             backtest_end_label = pd.to_datetime(backtest_end_dt).strftime("%Y-%m-%d")
 
         st.write("### 📋 Selection Summary")
-        summary_cols = st.columns(7)
-        summary_cols[0].metric("Strategy", results["strategy_name"])
-        summary_cols[1].metric("Risk Level", risk_level)
-        summary_cols[2].metric("Capital ($)", f"{capital:,.0f}")
-        summary_cols[3].metric("Start", strategy_start_label)
-        summary_cols[4].metric("As of", str(result_as_of))
         strategy_lookback = results.get("strategy_lookback_window")
-        if strategy_lookback:
-            summary_cols[5].metric("Strategy Lookback", f"{int(strategy_lookback)}d")
-        else:
-            summary_cols[5].metric("Strategy Lookback", "Auto")
-        summary_cols[6].metric("Drift Threshold", f"{drift_threshold:.1%}")
-        st.caption(
-            "Rebalance cadence: "
-            + rebalance_choice
-            + " · Backtest window: "
-            + backtest_start_label
-            + " → "
-            + backtest_end_label
-            + " · Selected sectors: "
-            + (", ".join(sectors) if sectors else "All available sectors")
+        summary_items = [
+            ("Strategy", results["strategy_name"]),
+            ("Risk Level", risk_level),
+            ("Capital ($)", f"{capital:,.0f}"),
+            ("Start", strategy_start_label),
+            ("As of", execution_label),
+            ("Data Through", analysis_label),
+            (
+                "Strategy Lookback",
+                f"{int(strategy_lookback)}d" if strategy_lookback else "Auto",
+            ),
+            ("Drift Threshold", f"{drift_threshold:.1%}"),
+        ]
+        for i in range(0, len(summary_items), 3):
+            row_items = summary_items[i : i + 3]
+            cols = st.columns(len(row_items))
+            for col, (label, value) in zip(cols, row_items):
+                col.markdown(
+                    f"<div><strong>{label}</strong><br>{value}</div>",
+                    unsafe_allow_html=True,
+                )
+        summary_details = "<br>".join(
+            [
+                f"<strong>Rebalance cadence:</strong> {rebalance_choice}",
+                f"<strong>Backtest window:</strong> {backtest_start_label} → {backtest_end_label}",
+                f"<strong>Data through:</strong> {analysis_label}",
+                f"<strong>Selected sectors:</strong> {', '.join(sectors) if sectors else 'All available sectors'}",
+            ]
         )
+        st.markdown(summary_details, unsafe_allow_html=True)
+        if allocation_carried:
+            st.info(
+                "Retained prior weights because new allocation data was unavailable for one or more holdings."
+            )
 
         st.divider()
         st.write("### 💼 Current Allocation Snapshot")
@@ -251,6 +330,8 @@ if run_button:
             st.info("No allocation available. Optimization stage did not produce weights.")
         else:
             alloc_display = current_allocation.copy()
+            if "CarryForward" in alloc_display.columns:
+                alloc_display = alloc_display.drop(columns=["CarryForward"])
             if "Weight" in alloc_display.columns:
                 alloc_display["Weight"] = alloc_display["Weight"].round(4)
             desired_order = ["Date", "Ticker", "Weight"]
@@ -399,6 +480,8 @@ if run_button:
         summary_start_label = pd.to_datetime(summary_start).strftime("%Y-%m-%d") if summary_start is not None else "-"
         summary_end_label = pd.to_datetime(summary_end).strftime("%Y-%m-%d") if summary_end is not None else "-"
 
+        weights_as_of = results.get("weights_as_of")
+
         st.write("### 📬 Trade Signals")
         if trade_signals is None or trade_signals.empty:
             st.info("No trade signals generated. Portfolio unchanged.")
@@ -413,16 +496,55 @@ if run_button:
                     pd.to_numeric(signals_display["New_Weight"], errors="coerce").round(4)
                 )
                 st.dataframe(signals_display, hide_index=True)
-            st.caption(
-                f"{len(signals_display)} trade instructions generated using a {drift_threshold:.1%} drift threshold."
-            )
+                caption_fragments = [
+                    f"{len(signals_display)} trade instructions generated using a {drift_threshold:.1%} drift threshold."
+                ]
+                if weights_as_of is not None:
+                    caption_fragments.append(
+                        f"Weights derived from price history through {pd.to_datetime(weights_as_of).strftime('%Y-%m-%d')}."
+                    )
+                st.caption(" ".join(caption_fragments))
 
         st.divider()
-        st.write("### 🧾 Trade Log History")
+        st.write("### 🧾 Generated Signal History")
         if trade_log is None or trade_log.empty:
-            st.info("Trade log is empty. Run at least one rebalance cycle.")
+            st.info("Generated signal history is empty. Run at least one rebalance cycle.")
         else:
             log_display = trade_log.copy()
+            if "Date" in log_display.columns:
+                log_display["Date"] = pd.to_datetime(
+                    log_display["Date"], errors="coerce"
+                )
+            if "Timestamp" in log_display.columns:
+                log_display["Timestamp"] = pd.to_datetime(
+                    log_display["Timestamp"], errors="coerce"
+                )
+            if "Execution_Date" in log_display.columns:
+                log_display["Execution_Date"] = pd.to_datetime(
+                    log_display["Execution_Date"], errors="coerce"
+                )
+            if "Data_Through" in log_display.columns:
+                log_display["Data_Through"] = pd.to_datetime(
+                    log_display["Data_Through"], errors="coerce"
+                )
+            sort_cols: list[str] = []
+            ascending: list[bool] = []
+            if "Data_Through" in log_display.columns:
+                sort_cols.append("Data_Through")
+                ascending.append(True)
+            elif "Date" in log_display.columns:
+                sort_cols.append("Date")
+                ascending.append(True)
+            if "Execution_Date" in log_display.columns:
+                sort_cols.append("Execution_Date")
+                ascending.append(True)
+            if "Ticker" in log_display.columns:
+                sort_cols.append("Ticker")
+                ascending.append(True)
+            if sort_cols:
+                log_display = log_display.sort_values(
+                    sort_cols, ascending=ascending, kind="mergesort"
+                ).reset_index(drop=True)
             if "Old_Weight" in log_display.columns:
                 log_display["Old_Weight"] = (
                     pd.to_numeric(log_display["Old_Weight"], errors="coerce").round(4)
@@ -431,15 +553,47 @@ if run_button:
                 log_display["New_Weight"] = (
                     pd.to_numeric(log_display["New_Weight"], errors="coerce").round(4)
                 )
-            desired_log_order = ["Date", "Ticker", "Signal", "Old_Weight", "New_Weight", "Reason", "Timestamp"]
+            if "Date" in log_display.columns:
+                log_display["Date"] = log_display["Date"].dt.strftime("%Y-%m-%d")
+            if "Timestamp" in log_display.columns:
+                log_display["Timestamp"] = log_display["Timestamp"].dt.strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+            if "Execution_Date" in log_display.columns:
+                log_display["Execution_Date"] = log_display["Execution_Date"].dt.strftime(
+                    "%Y-%m-%d"
+                )
+            if "Data_Through" in log_display.columns:
+                log_display["Data_Through"] = log_display["Data_Through"].dt.strftime(
+                    "%Y-%m-%d"
+                )
+            desired_log_order = [
+                "Data_Through",
+                "Execution_Date",
+                "Ticker",
+                "Signal",
+                "Old_Weight",
+                "New_Weight",
+                "Reason",
+                "Timestamp",
+            ]
             log_display = log_display[[col for col in desired_log_order if col in log_display.columns]]
-            st.dataframe(log_display.tail(100).reset_index(drop=True), hide_index=True)
-            st.caption("Most recent 100 trade entries from the session log.")
+            st.dataframe(log_display.tail(100), hide_index=True)
+            log_caption = "Most recent 100 generated signals."
+            if weights_as_of is not None:
+                log_caption += f" Signals reflect data through {pd.to_datetime(weights_as_of).strftime('%Y-%m-%d')}."
+            st.caption(log_caption)
 
         st.divider()
         st.write("### 🔁 Backtest Transactions")
+        missing_price_notes = backtest_summary.get("missing_price_notes", []) if backtest_available else []
         if transactions_df is None or transactions_df.empty:
-            st.info("No backtest transactions available.")
+            if missing_price_notes:
+                st.warning(
+                    "No backtest transactions recorded. Reasons: " + " | ".join(missing_price_notes)
+                )
+            else:
+                st.info("No backtest transactions available.")
         else:
             display_tx = transactions_df.copy()
             numeric_cols = [
@@ -498,9 +652,14 @@ if run_button:
         st.divider()
         st.write(f"### 🔄 Backtest ({rebalance_choice} Rebalance)")
         if not backtest_available:
-            st.info(
-                "Backtest unavailable. Ensure sufficient price history and weights, then rerun."
-            )
+            if backtest_error:
+                st.warning(
+                    f"Backtest unavailable: {backtest_error}"
+                )
+            else:
+                st.info(
+                    "Backtest unavailable. Ensure sufficient price history and weights, then rerun."
+                )
         else:
             backtest_summary_cols = st.columns(5)
             backtest_summary_cols[0].metric("Invested", _fmt_dollar(invested_amt))
@@ -525,6 +684,8 @@ if run_button:
             ]
             if calendar_notes:
                 st.caption("Calendar adjustments: " + " | ".join(calendar_notes))
+            if missing_price_notes:
+                st.caption("Skipped trades: " + " | ".join(missing_price_notes))
 
             if backtest_curve is not None and not backtest_curve.empty:
                 chart_df = backtest_curve.copy()

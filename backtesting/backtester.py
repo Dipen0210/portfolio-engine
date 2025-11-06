@@ -1,14 +1,15 @@
 # backtesting/backtester.py
 import pandas as pd
 import numpy as np
+import math
 from .metrics import compute_performance_metrics
 
 
-def _prepare_close_series(df: pd.DataFrame, ticker: str) -> pd.Series | None:
+def _prepare_price_series(df: pd.DataFrame, ticker: str, column: str) -> pd.Series | None:
     """
-    Ensure the OHLCV DataFrame is indexed by datetime and return the Close series.
+    Ensure the OHLCV DataFrame is indexed by datetime and return the requested price series.
     """
-    if "Close" not in df.columns:
+    if column not in df.columns:
         return None
 
     working = df.copy()
@@ -22,7 +23,7 @@ def _prepare_close_series(df: pd.DataFrame, ticker: str) -> pd.Series | None:
             return None
 
     working = working.sort_index()
-    return working["Close"].rename(ticker)
+    return working[column].rename(ticker)
 
 
 def backtest_portfolio(
@@ -158,13 +159,17 @@ def backtest_portfolio(
         trade_log_lookup = log_work.groupby(["LookupDate", "Ticker"]).last()
 
     close_series = []
+    open_series = []
     for ticker in all_tickers:
         df = price_data_dict.get(ticker)
         if df is None or df.empty:
             continue
-        series = _prepare_close_series(df, ticker)
-        if series is not None and not series.empty:
-            close_series.append(series)
+        close_ser = _prepare_price_series(df, ticker, "Close")
+        open_ser = _prepare_price_series(df, ticker, "Open")
+        if close_ser is not None and not close_ser.empty:
+            close_series.append(close_ser)
+        if open_ser is not None and not open_ser.empty:
+            open_series.append(open_ser)
 
     if not close_series:
         raise ValueError("Backtest failed: no valid price history for the selected tickers.")
@@ -173,6 +178,13 @@ def backtest_portfolio(
     close_prices = close_prices.sort_index()
     close_prices = close_prices.loc[~close_prices.index.duplicated()]
     close_prices = close_prices.dropna(axis=1, how="all")
+
+    open_prices = None
+    if open_series:
+        open_prices = pd.concat(open_series, axis=1)
+        open_prices = open_prices.sort_index()
+        open_prices = open_prices.loc[~open_prices.index.duplicated()]
+        open_prices = open_prices.dropna(axis=1, how="all")
 
     if close_prices.empty:
         raise ValueError("Backtest failed: price history is empty after alignment.")
@@ -198,22 +210,69 @@ def backtest_portfolio(
         raise ValueError("Backtest failed: no overlapping price history within the selected window.")
 
     close_prices = close_prices[available_tickers]
+    if open_prices is not None:
+        open_prices = open_prices.reindex(close_prices.index)
+        open_prices = open_prices[available_tickers]
+        open_prices = open_prices.ffill()
 
     trading_days = close_prices.index
     if len(trading_days) == 0:
         raise ValueError("Backtest failed: no trading days available in the window.")
 
-    def _align_to_trading_day(candidate: pd.Timestamp) -> pd.Timestamp | None:
-        positions = trading_days.get_indexer([candidate], method="backfill")
-        if positions.size == 0:
-            return None
-        loc = positions[0]
-        if loc == -1:
-            return None
-        return trading_days[loc]
+    def _align_to_trading_day(
+        candidate: pd.Timestamp,
+    ) -> tuple[pd.Timestamp | None, str | None]:
+        """
+        Align a requested timestamp to an available trading day.
+
+        Returns a tuple of (aligned_date, alignment_direction) where
+        alignment_direction is one of:
+            * None: no adjustment needed (same day)
+            * "forward": shifted to the next available trading day
+            * "backward": shifted to the prior available trading day (price data missing)
+        """
+        if len(trading_days) == 0:
+            return None, None
+
+        ts = pd.Timestamp(candidate).normalize()
+
+        try:
+            exact_loc = trading_days.get_loc(ts)
+            return trading_days[exact_loc], None
+        except KeyError:
+            pass
+
+        idx = trading_days.searchsorted(ts, side="left")
+        if idx < len(trading_days):
+            aligned = trading_days[idx]
+            direction = None
+            if aligned.normalize() != ts:
+                direction = "forward"
+            return aligned, direction
+
+        # Candidate occurs after the last available trading day -> fall back to most recent day.
+        aligned = trading_days[-1]
+        direction = "backward"
+        if aligned.normalize() == ts:
+            direction = None
+        return aligned, direction
 
     snapshot_schedule_map: dict[pd.Timestamp, dict] = {}
     calendar_notes: list[str] = []
+    missing_price_notes: list[str] = []
+    share_precision = 4
+
+    def _round_down_shares(value: float) -> float:
+        if value <= 0:
+            return 0.0
+        factor = 10 ** share_precision
+        return math.floor(value * factor + 1e-12) / factor
+
+    def _round_to_shares(value: float) -> float:
+        factor = 10 ** share_precision
+        if value >= 0:
+            return math.floor(value * factor + 0.5) / factor
+        return -math.floor(-value * factor + 0.5) / factor
     for snap in weight_snapshots:
         weights_series = snap["weights"]
         requested_date = snap.get("requested_date")
@@ -222,14 +281,17 @@ def backtest_portfolio(
         if requested_date is None:
             aligned_date = trading_days[0]
             normalized_requested = aligned_date
+            alignment_direction = None
         else:
             candidate = pd.Timestamp(requested_date)
             normalized_requested = candidate.normalize()
-            aligned_date = _align_to_trading_day(candidate)
+            aligned_date, alignment_direction = _align_to_trading_day(candidate)
             if aligned_date is None:
-                aligned_date = _align_to_trading_day(normalized_requested)
+                aligned_date, alignment_direction = _align_to_trading_day(normalized_requested)
             if aligned_date is None:
                 continue
+        if requested_date is None:
+            alignment_direction = None
 
         reindexed = weights_series.reindex(available_tickers).fillna(0.0)
         total_weight = reindexed.sum()
@@ -238,9 +300,15 @@ def backtest_portfolio(
 
         holiday_note = None
         if requested_date is not None and aligned_date.normalize() != normalized_requested.normalize():
-            holiday_note = (
-                f"Signal dated {normalized_requested.date()} executed on next trading day {aligned_date.date()}."
-            )
+            if alignment_direction == "backward":
+                holiday_note = (
+                    f"Signal dated {normalized_requested.date()} executed on prior trading day "
+                    f"{aligned_date.date()} (latest price data unavailable on signal date)."
+                )
+            else:
+                holiday_note = (
+                    f"Signal dated {normalized_requested.date()} executed on next trading day {aligned_date.date()}."
+                )
             calendar_notes.append(holiday_note)
 
         snapshot_schedule_map[aligned_date] = {
@@ -275,7 +343,7 @@ def backtest_portfolio(
             freq=rebalance_rule,
         )
         for candidate in raw_schedule[1:]:
-            aligned = _align_to_trading_day(candidate)
+            aligned, _ = _align_to_trading_day(candidate)
             if aligned is not None and aligned != schedule[-1]:
                 schedule.append(aligned)
         rebalance_candidate_set = set(schedule[1:])
@@ -291,7 +359,13 @@ def backtest_portfolio(
     next_snapshot_idx = 0
 
     for day in trading_days:
-        prices = close_prices.loc[day]
+        close_prices_today = close_prices.loc[day]
+        open_prices_today = None
+        if open_prices is not None:
+            try:
+                open_prices_today = open_prices.loc[day]
+            except KeyError:
+                open_prices_today = None
 
         weight_update_today = False
         plan_old_weights = prev_target_weights.copy()
@@ -310,7 +384,7 @@ def backtest_portfolio(
 
         if current_target_weights is None:
             # No weights available yet; skip until first allocation snapshot.
-            portfolio_value = float((holdings * prices).sum() + cash_balance)
+            portfolio_value = float((holdings * close_prices_today).sum() + cash_balance)
             portfolio_records.append({"Date": day, "Portfolio Value": portfolio_value})
             continue
 
@@ -327,7 +401,7 @@ def backtest_portfolio(
             should_rebalance_today = True
             event_label = "Scheduled Rebalance"
 
-        base_value = float((holdings * prices).sum() + cash_balance)
+        base_value = float((holdings * close_prices_today).sum() + cash_balance)
 
         if holiday_note_today:
             transactions.append(
@@ -350,27 +424,53 @@ def backtest_portfolio(
             )
 
         if should_rebalance_today and plan_new_weights is not None and base_value > 0:
-            day_cash_flow = 0.0
-            trades_executed = False
             plan_old_aligned = plan_old_weights.reindex(holdings.index, fill_value=0.0)
             plan_new_aligned = plan_new_weights.reindex(holdings.index, fill_value=0.0)
+
+            target_shares_map: dict[str, float] = {}
             for ticker in holdings.index:
-                price = prices[ticker]
+                price = close_prices_today[ticker]
                 if pd.isna(price) or price <= 0:
+                    target_shares_map[ticker] = float(holdings.at[ticker])
                     continue
-                target_weight = float(plan_new_aligned.at[ticker])
-                target_value = base_value * target_weight
-                target_shares = target_value / price if price else 0.0
-                old_shares = holdings.at[ticker]
+                weight_plan = max(float(plan_new_aligned.at[ticker]), 0.0)
+                desired_value = weight_plan * base_value
+                desired_shares = desired_value / price if price > 0 else float(holdings.at[ticker])
+                target_shares_map[ticker] = _round_down_shares(desired_shares)
+
+            day_transactions: list[dict] = []
+            for ticker in holdings.index:
+                close_price = close_prices_today[ticker]
+                if pd.isna(close_price) or close_price <= 0:
+                    missing_price_notes.append(
+                        f"{pd.Timestamp(day).date()} · {ticker}: missing close price; trade skipped."
+                    )
+                    continue
+                trade_price = None
+                if open_prices_today is not None and ticker in open_prices_today.index:
+                    trade_price = open_prices_today[ticker]
+                if pd.isna(trade_price) or trade_price is None or trade_price <= 0:
+                    trade_price = close_price
+                if pd.isna(trade_price) or trade_price <= 0:
+                    missing_price_notes.append(
+                        f"{pd.Timestamp(day).date()} · {ticker}: missing open/close price; trade skipped."
+                    )
+                    continue
+
+                target_shares = max(target_shares_map.get(ticker, float(holdings.at[ticker])), 0.0)
+                target_shares = _round_to_shares(target_shares)
+                old_shares = float(holdings.at[ticker])
                 delta_shares = target_shares - old_shares
                 if abs(delta_shares) <= 1e-9:
                     continue
-                shares_traded = abs(delta_shares)
+
                 action = "BUY" if delta_shares > 0 else "SELL"
-                trade_value = shares_traded * price
+                shares_traded = abs(delta_shares)
+                trade_value = shares_traded * trade_price
                 cash_flow = -trade_value if action == "BUY" else trade_value
-                day_cash_flow += cash_flow
-                actual_old_weight = (old_shares * price) / base_value if base_value > 0 else 0.0
+
+                actual_old_weight = (old_shares * close_price) / base_value if base_value > 0 else 0.0
+                actual_new_weight = (target_shares * close_price) / base_value if base_value > 0 else 0.0
 
                 if weight_update_today:
                     old_weight_plan = float(plan_old_aligned.at[ticker])
@@ -378,22 +478,24 @@ def backtest_portfolio(
                     if prev_plan_sum <= 1e-12:
                         signal = "BUY"
                         reason = "Initial portfolio allocation"
-                    elif old_weight_plan <= 1e-12 and target_weight > 0:
+                    elif old_weight_plan <= 1e-12 and target_shares > 0:
                         signal = "BUY"
                         reason = "Newly added to optimized portfolio"
-                    elif target_weight <= 1e-12 and old_weight_plan > 0:
+                    elif target_shares <= 1e-12 and old_weight_plan > 0:
                         signal = "SELL"
                         reason = "Removed from new optimized portfolio"
                     else:
-                        drift = abs(target_weight - old_weight_plan) / old_weight_plan if old_weight_plan > 0 else 0.0
+                        target_weight_plan = float(plan_new_aligned.at[ticker])
+                        drift = abs(target_weight_plan - old_weight_plan) / old_weight_plan if old_weight_plan > 0 else 0.0
                         signal = "REBALANCE"
                         reason = f"Weight drifted by {drift:.2%}"
                     old_weight_to_log = old_weight_plan
                 else:
                     signal = "REBALANCE"
-                    comparison_base = actual_old_weight if actual_old_weight > 0 else target_weight
+                    target_weight_plan = float(plan_new_aligned.at[ticker])
+                    comparison_base = actual_old_weight if actual_old_weight > 0 else target_weight_plan
                     if comparison_base > 0:
-                        drift = abs(target_weight - actual_old_weight) / comparison_base
+                        drift = abs(target_weight_plan - actual_old_weight) / comparison_base
                     else:
                         drift = float("inf")
                     reason = (
@@ -406,7 +508,7 @@ def backtest_portfolio(
                 recorded_signal = signal
                 recorded_reason = reason
                 recorded_old_weight = float(old_weight_to_log)
-                recorded_new_weight = float(target_weight)
+                recorded_new_weight = float(actual_new_weight)
                 recorded_timestamp = None
                 log_entry = None
                 if trade_log_lookup is not None:
@@ -429,7 +531,7 @@ def backtest_portfolio(
                     if "Timestamp" in log_entry and pd.notna(log_entry["Timestamp"]):
                         recorded_timestamp = pd.to_datetime(log_entry["Timestamp"])
 
-                transactions.append(
+                day_transactions.append(
                     {
                         "Date": day,
                         "Event": event_label or "Rebalance",
@@ -437,7 +539,7 @@ def backtest_portfolio(
                         "Action": action,
                         "Signal": recorded_signal,
                         "Shares": shares_traded,
-                        "Price": price,
+                        "Price": trade_price,
                         "TradeValue": trade_value,
                         "CashFlow": cash_flow,
                         "Old_Weight": recorded_old_weight,
@@ -447,17 +549,21 @@ def backtest_portfolio(
                         "Timestamp": recorded_timestamp,
                     }
                 )
-                holdings.at[ticker] = target_shares
-                trades_executed = True
+                holdings.at[ticker] = max(target_shares, 0.0)
 
-            if trades_executed:
-                cash_balance += day_cash_flow
+            if day_transactions:
+                total_cash_flow = sum(tx["CashFlow"] for tx in day_transactions)
+                cash_balance += total_cash_flow
+                holdings_value = float((holdings * close_prices_today).sum())
+                cash_balance = base_value - holdings_value
+                if cash_balance < 0 and abs(cash_balance) <= 1e-6:
+                    cash_balance = 0.0
+                transactions.extend(day_transactions)
                 executed_rebalance_dates.append(day)
-
         if weight_update_today and current_target_weights is not None:
             prev_target_weights = current_target_weights.copy()
 
-        portfolio_value = float((holdings * prices).sum() + cash_balance)
+        portfolio_value = float((holdings * close_prices_today).sum() + cash_balance)
         portfolio_records.append({"Date": day, "Portfolio Value": portfolio_value})
 
     portfolio_df = pd.DataFrame(portfolio_records).set_index("Date")
@@ -472,7 +578,7 @@ def backtest_portfolio(
     benchmark_curve = None
     benchmark_metrics = None
     if benchmark_df is not None and not benchmark_df.empty:
-        benchmark_series = _prepare_close_series(benchmark_df, "Benchmark")
+        benchmark_series = _prepare_price_series(benchmark_df, "Benchmark", "Close")
         if benchmark_series is not None and not benchmark_series.empty:
             benchmark_series = benchmark_series.reindex(portfolio_df.index).ffill().dropna()
             if not benchmark_series.empty:
@@ -530,7 +636,10 @@ def backtest_portfolio(
         holdings_snapshot = pd.concat([holdings_snapshot, cash_row], ignore_index=True)
     holdings_snapshot = holdings_snapshot.reindex(columns=["Ticker", "Shares", "Price", "MarketValue"])
 
-    calendar_notes = list(dict.fromkeys(calendar_notes))
+    if calendar_notes:
+        calendar_notes = list(dict.fromkeys(calendar_notes))
+    if missing_price_notes:
+        missing_price_notes = list(dict.fromkeys(missing_price_notes))
 
     summary = {
         "initial_capital": float(initial_capital),
@@ -542,6 +651,7 @@ def backtest_portfolio(
         "end_date": portfolio_df.index[-1],
         "ending_cash": float(cash_balance),
         "calendar_notes": calendar_notes,
+        "missing_price_notes": missing_price_notes,
     }
 
     return {
