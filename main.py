@@ -7,6 +7,7 @@ import plotly.express as px
 import streamlit as st
 from pandas.tseries.holiday import USFederalHolidayCalendar
 
+from execution.execution_engine import run_rebalance_cycle as execute_rebalance
 from execution.portfolio_state import PortfolioState
 from hardfilters.data_utils import load_company_universe
 from rebalance.rebalance_controller import run_rebalance_cycle
@@ -121,6 +122,85 @@ def _previous_trading_day(target_dt: datetime) -> datetime:
     return dt.to_pydatetime()
 
 
+def _get_portfolio_equity(state: PortfolioState) -> float:
+    history = getattr(state, "portfolio_value_history", None)
+    if history is not None and not history.empty and "Value" in history.columns:
+        values = pd.to_numeric(history["Value"], errors="coerce").dropna()
+        if not values.empty:
+            return float(values.iloc[-1])
+    return float(state.cash)
+
+
+def _prepare_price_history_for_execution(price_history: dict[str, pd.DataFrame], execution_dt: datetime) -> dict[str, pd.DataFrame]:
+    if not price_history:
+        return {}
+    exec_ts = pd.Timestamp(execution_dt).normalize()
+    sliced: dict[str, pd.DataFrame] = {}
+    for ticker, df in price_history.items():
+        if df is None or df.empty:
+            continue
+        temp = df.copy()
+        if "Date" in temp.columns:
+            temp["Date"] = pd.to_datetime(temp["Date"], errors="coerce")
+            temp = temp[temp["Date"] <= exec_ts]
+        else:
+            temp.index = pd.to_datetime(temp.index)
+            temp = temp[temp.index <= exec_ts]
+        if temp.empty or "Close" not in temp.columns:
+            continue
+        sliced[ticker] = temp
+    return sliced
+
+
+def _latest_prices(price_history: dict[str, pd.DataFrame]) -> dict[str, float]:
+    prices: dict[str, float] = {}
+    for ticker, df in price_history.items():
+        if df is None or df.empty or "Close" not in df.columns:
+            continue
+        try:
+            prices[ticker] = float(pd.to_numeric(df["Close"], errors="coerce").dropna().iloc[-1])
+        except (IndexError, ValueError):
+            continue
+    return prices
+
+
+def _resolve_backtest_start(state: PortfolioState, default_dt: datetime) -> datetime:
+    """
+    Pick the earliest date observed in session history so backtests keep the full run record.
+    """
+    candidates: list[pd.Timestamp] = []
+    signal_log = getattr(state, "signal_log", None)
+    if signal_log is not None and not signal_log.empty:
+        for col in ("Execution_Date", "Date", "Data_Through"):
+            if col in signal_log.columns:
+                series = pd.to_datetime(signal_log[col], errors="coerce").dropna()
+                if not series.empty:
+                    candidates.append(series.min().normalize())
+    trade_log = getattr(state, "trade_log", None)
+    if trade_log is not None and not trade_log.empty and "Date" in trade_log.columns:
+        series = pd.to_datetime(trade_log["Date"], errors="coerce").dropna()
+        if not series.empty:
+            candidates.append(series.min().normalize())
+    history = getattr(state, "portfolio_value_history", None)
+    if history is not None and not history.empty:
+        date_col = None
+        for col in ("Date", "date"):
+            if col in history.columns:
+                date_col = col
+                break
+        if date_col is not None:
+            series = pd.to_datetime(history[date_col], errors="coerce").dropna()
+            if not series.empty:
+                candidates.append(series.min().normalize())
+    if not candidates:
+        return default_dt
+    earliest = min(candidates)
+    baseline = pd.Timestamp(default_dt).normalize()
+    if earliest is None or pd.isna(earliest):
+        return default_dt
+    return min(earliest.to_pydatetime(), baseline.to_pydatetime())
+
+
 sectors_token = "-".join(sorted(sectors)) if sectors else "all"
 execution_date = _next_trading_day(as_of_date)
 try:
@@ -191,10 +271,11 @@ if run_button:
 
     # Initialize state (simulated portfolio memory)
     state = st.session_state["portfolio_state"]
-    state.cash = capital
+    cycle_equity = _get_portfolio_equity(state)
 
     analysis_anchor_dt = analysis_anchor
     execution_anchor_dt = execution_anchor
+    backtest_start_dt = _resolve_backtest_start(state, analysis_anchor_dt)
     last_rebalance_str = timeline_state.get("last_rebalance")
     last_rebalance = (
         datetime.strptime(last_rebalance_str, "%Y-%m-%d")
@@ -226,10 +307,10 @@ if run_button:
                 user_strategy=strategy,
                 user_sectors=sectors,
                 risk_level=risk_level,
-                capital=capital,
+                capital=cycle_equity,
                 as_of_date=target_analysis,
                 execution_date=target_execution,
-                backtest_start_date=analysis_anchor_dt,
+                backtest_start_date=backtest_start_dt,
                 backtest_end_date=target_execution,
                 backtest_rebalance_freq=rebalance_code,
                 drift_threshold=drift_threshold,
@@ -287,12 +368,64 @@ if run_button:
         if backtest_end_dt is not None:
             backtest_end_label = pd.to_datetime(backtest_end_dt).strftime("%Y-%m-%d")
 
+        post_trade_equity = cycle_equity
+        execution_warning = None
+        execution_prices = {}
+        execution_dt = None
+        price_history = results.get("price_history", {})
+        if execution_used is not None:
+            execution_dt = pd.to_datetime(execution_used)
+            execution_prices = _prepare_price_history_for_execution(price_history, execution_dt)
+            if execution_prices:
+                allocation_for_exec = None
+                if current_allocation is not None and not current_allocation.empty:
+                    allocation_for_exec = (
+                        current_allocation.loc[:, ["Ticker", "Weight"]]
+                        .copy()
+                    )
+                    if not allocation_for_exec.empty:
+                        allocation_for_exec["Weight"] = (
+                            pd.to_numeric(allocation_for_exec["Weight"], errors="coerce")
+                            .fillna(0.0)
+                        )
+                        allocation_for_exec["Ticker"] = allocation_for_exec["Ticker"].astype(str).str.strip()
+                        allocation_for_exec = allocation_for_exec[
+                            (allocation_for_exec["Ticker"] != "")
+                            & (allocation_for_exec["Weight"] > 0)
+                        ]
+                if allocation_for_exec is not None and not allocation_for_exec.empty:
+                    try:
+                        execute_rebalance(
+                            state=state,
+                            price_data_dict=execution_prices,
+                            new_portfolio_weights=allocation_for_exec.loc[:, ["Ticker", "Weight"]],
+                            date=execution_dt.strftime("%Y-%m-%d"),
+                        )
+                    except Exception as exc:
+                        execution_warning = f"Live portfolio update failed: {exc}"
+                else:
+                    latest_prices = _latest_prices(execution_prices)
+                    if latest_prices:
+                        post_trade_equity = state.mark_to_market(
+                            execution_dt.strftime("%Y-%m-%d"),
+                            latest_prices,
+                        )
+                post_trade_equity = _get_portfolio_equity(state)
+            else:
+                execution_warning = (
+                    "Unable to update live portfolio — missing price data for the execution date."
+                )
+
+        if execution_warning:
+            st.warning(execution_warning)
+
         st.write("### 📋 Selection Summary")
         strategy_lookback = results.get("strategy_lookback_window")
         summary_items = [
             ("Strategy", results["strategy_name"]),
             ("Risk Level", risk_level),
-            ("Capital ($)", f"{capital:,.0f}"),
+            ("Cycle Equity ($)", f"{cycle_equity:,.0f}"),
+            ("Post-Trade Equity ($)", f"{post_trade_equity:,.0f}"),
             ("Start", strategy_start_label),
             ("As of", execution_label),
             ("Data Through", analysis_label),
@@ -627,10 +760,16 @@ if run_button:
             display_tx = display_tx[
                 [c for c in column_order if c in display_tx.columns]
             ]
-            st.dataframe(display_tx, hide_index=True)
-            st.caption(
-                f"{len(display_tx)} trades recorded across the backtest window. Positive CashFlow reflects capital returned to cash."
-            )
+            total_trades = len(display_tx)
+            visible_tx = display_tx.head(100)
+            rows_shown = len(visible_tx)
+            table_height = min(900, 60 + rows_shown * 28)
+            st.dataframe(visible_tx, hide_index=True, height=table_height)
+            caption = f"{total_trades} trades recorded across the backtest window. "
+            if rows_shown < total_trades:
+                caption += f"Showing the first {rows_shown} trades. "
+            caption += "Positive CashFlow reflects capital returned to cash."
+            st.caption(caption)
 
         st.divider()
         st.write("### 📂 Open Backtest Holdings")

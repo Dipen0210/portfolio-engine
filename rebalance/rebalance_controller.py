@@ -163,8 +163,22 @@ def run_rebalance_cycle(
         .reset_index(drop=True)
     )
 
-    # 2) Fetch OHLCV data for all unique tickers in the candidate pool.
-    ordered_tickers = candidate_pool_df["ticker"].tolist()
+    previous_tickers: list[str] = []
+    if previous_allocation is not None and not previous_allocation.empty:
+        if "Ticker" in previous_allocation.columns:
+            previous_tickers = (
+                previous_allocation["Ticker"]
+                .astype(str)
+                .str.strip()
+                .tolist()
+            )
+
+    position_tickers: list[str] = []
+    if hasattr(state, "positions") and getattr(state, "positions"):
+        position_tickers = [str(t).strip() for t in state.positions.keys() if str(t).strip()]
+
+    # 2) Fetch OHLCV data for all unique tickers in the candidate pool and existing holdings.
+    ordered_tickers = candidate_pool_df["ticker"].tolist() + previous_tickers + position_tickers
     seen = set()
     unique_tickers = []
     for ticker in ordered_tickers:
