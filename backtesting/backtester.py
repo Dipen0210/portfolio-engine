@@ -362,16 +362,26 @@ def backtest_portfolio(
         rebalance_candidate_set = set(schedule[1:])
 
     holdings = pd.Series(0.0, index=close_prices.columns, dtype=float)
+    holdings_cost = pd.Series(0.0, index=close_prices.columns, dtype=float)
+    holdings_entry_date = pd.Series(pd.NaT, index=close_prices.columns, dtype="datetime64[ns]")
+    holdings_cycle_open_price = pd.Series(np.nan, index=close_prices.columns, dtype=float)
     cash_balance = float(initial_capital)
     transactions: list[dict] = []
     portfolio_records: list[dict] = []
     executed_rebalance_dates: list[pd.Timestamp] = []
+    realized_pnl = 0.0
+    unrealized_pnl = 0.0
+    total_transaction_cost = 0.0
 
     prev_target_weights = pd.Series(0.0, index=holdings.index, dtype=float)
     current_target_weights: pd.Series | None = None
     next_snapshot_idx = 0
 
-    for day in trading_days:
+    next_day_price: pd.Series | None = None
+    for idx, day in enumerate(trading_days):
+        next_day_price = None
+        if idx + 1 < len(trading_days):
+            next_day_price = close_prices.loc[trading_days[idx + 1]]
         close_prices_today = close_prices.loc[day]
         open_prices_today = None
         if open_prices is not None:
@@ -415,6 +425,7 @@ def backtest_portfolio(
             event_label = "Scheduled Rebalance"
 
         base_value = float((holdings * close_prices_today).sum() + cash_balance)
+        day_open_price_cache: dict[str, float] = {}
 
         if holiday_note_today:
             transactions.append(
@@ -453,45 +464,108 @@ def backtest_portfolio(
 
             day_transactions: list[dict] = []
             cash_pointer = cash_balance
+            processing_meta: list[tuple[str, float, float]] = []
             for ticker in holdings.index:
+                target_value = max(target_shares_map.get(ticker, float(holdings.at[ticker])), 0.0)
+                processing_meta.append((ticker, target_value, float(holdings.at[ticker])))
+
+            selling_meta = [
+                meta for meta in processing_meta if meta[1] + 1e-9 < meta[2]
+            ]
+            buying_meta = [
+                meta for meta in processing_meta if meta not in selling_meta
+            ]
+
+            for ticker, target_shares, old_shares in selling_meta + buying_meta:
                 close_price = close_prices_today[ticker]
                 if pd.isna(close_price) or close_price <= 0:
                     missing_price_notes.append(
                         f"{pd.Timestamp(day).date()} · {ticker}: missing close price; trade skipped."
                     )
                     continue
-                trade_price = None
+                execution_open = None
                 if open_prices_today is not None and ticker in open_prices_today.index:
-                    trade_price = open_prices_today[ticker]
-                if pd.isna(trade_price) or trade_price is None or trade_price <= 0:
-                    trade_price = close_price
-                if pd.isna(trade_price) or trade_price <= 0:
+                    execution_open = open_prices_today[ticker]
+                if pd.isna(execution_open) or execution_open is None or execution_open <= 0:
+                    execution_open = close_price
+                if pd.isna(execution_open) or execution_open <= 0:
                     missing_price_notes.append(
                         f"{pd.Timestamp(day).date()} · {ticker}: missing open/close price; trade skipped."
                     )
                     continue
+                day_open_price_cache[ticker] = float(execution_open)
 
                 target_shares = max(target_shares_map.get(ticker, float(holdings.at[ticker])), 0.0)
                 target_shares = _round_to_shares(target_shares)
                 old_shares = float(holdings.at[ticker])
                 delta_shares = target_shares - old_shares
+                shares_sell = max(old_shares - target_shares, 0.0)
+                shares_hold = min(old_shares, target_shares)
+
+                prev_open = holdings_cycle_open_price.at[ticker]
+                if shares_hold > 0 and not pd.isna(prev_open):
+                    unrealized_pnl += (execution_open - prev_open) * shares_hold
+                if shares_sell > 0 and not pd.isna(prev_open):
+                    realized_pnl += (execution_open - prev_open) * shares_sell
+
                 if abs(delta_shares) <= 1e-9:
+                    if target_shares > 0:
+                        holdings_cycle_open_price.at[ticker] = float(execution_open)
+                    else:
+                        holdings_cycle_open_price.at[ticker] = np.nan
                     continue
 
                 action = "BUY" if delta_shares > 0 else "SELL"
                 shares_traded = abs(delta_shares)
-                fill_price = apply_slippage(trade_price, action, slippage_bps=slippage_bps)
+                fill_price = apply_slippage(execution_open, action, slippage_bps=slippage_bps)
                 trade_value = shares_traded * fill_price
+                if action == "BUY":
+                    while shares_traded > 0:
+                        commission = calc_commission(
+                            order_value=fill_price * shares_traded,
+                            per_trade=commission_per_trade,
+                            bps=commission_bps,
+                        )
+                        total_cost = fill_price * shares_traded + commission
+                        if total_cost <= cash_pointer + 1e-8:
+                            break
+                        shares_traded -= 1
+                    if shares_traded <= 0:
+                        holdings_cycle_open_price.at[ticker] = float(execution_open)
+                        continue
+                    trade_value = shares_traded * fill_price
                 commission = calc_commission(
                     order_value=trade_value,
                     per_trade=commission_per_trade,
                     bps=commission_bps,
                 )
+                total_transaction_cost += commission
                 cash_flow = -trade_value if action == "BUY" else trade_value
-                transaction_cost = -commission
+                transaction_cost_signed = -commission
+                cash_pointer += cash_flow + transaction_cost_signed
 
                 actual_old_weight = (old_shares * close_price) / base_value if base_value > 0 else 0.0
                 actual_new_weight = (target_shares * close_price) / base_value if base_value > 0 else 0.0
+
+                if action == "BUY":
+                    holdings_cost.at[ticker] += trade_value
+                    if old_shares <= 1e-9:
+                        holdings_entry_date.at[ticker] = pd.Timestamp(day)
+                else:
+                    existing_cost = float(holdings_cost.at[ticker])
+                    cost_per_share = existing_cost / old_shares if old_shares > 0 else 0.0
+                    cost_removed = min(existing_cost, cost_per_share * shares_traded)
+                    holdings_cost.at[ticker] = max(existing_cost - cost_removed, 0.0)
+                if action == "BUY":
+                    target_shares = old_shares + shares_traded
+                actual_new_weight = (target_shares * close_price) / base_value if base_value > 0 else 0.0
+                if target_shares > 0:
+                    holdings_cycle_open_price.at[ticker] = float(execution_open)
+                else:
+                    holdings_cycle_open_price.at[ticker] = np.nan
+                if holdings.at[ticker] <= 0 or holdings_cost.at[ticker] < 1e-9:
+                    holdings_cost.at[ticker] = 0.0
+                    holdings_entry_date.at[ticker] = pd.NaT
 
                 if weight_update_today:
                     old_weight_plan = float(plan_old_aligned.at[ticker])
@@ -552,7 +626,6 @@ def backtest_portfolio(
                     if "Timestamp" in log_entry and pd.notna(log_entry["Timestamp"]):
                         recorded_timestamp = pd.to_datetime(log_entry["Timestamp"])
 
-                cash_pointer += cash_flow + transaction_cost
                 day_transactions.append(
                     {
                         "Date": day,
@@ -564,7 +637,7 @@ def backtest_portfolio(
                         "Price": fill_price,
                         "TradeValue": trade_value,
                         "CashFlow": cash_flow,
-                        "Transaction Cost": transaction_cost,
+                        "Transaction Cost": transaction_cost_signed,
                         "RemainingCash": cash_pointer,
                         "Old_Weight": recorded_old_weight,
                         "New_Weight": recorded_new_weight,
@@ -574,6 +647,10 @@ def backtest_portfolio(
                     }
                 )
                 holdings.at[ticker] = max(target_shares, 0.0)
+                if holdings.at[ticker] <= 0:
+                    holdings_entry_date.at[ticker] = pd.NaT
+                if holdings.at[ticker] <= 0 or holdings_cost.at[ticker] < 1e-9:
+                    holdings_cost.at[ticker] = 0.0
 
             if day_transactions:
                 total_cash_flow = sum(
@@ -585,10 +662,41 @@ def backtest_portfolio(
                     cash_balance = 0.0
                 transactions.extend(day_transactions)
                 executed_rebalance_dates.append(day)
+        if should_rebalance_today:
+            for ticker in holdings.index:
+                current_shares = float(holdings.at[ticker])
+                if current_shares > 0:
+                    base_px = day_open_price_cache.get(ticker)
+                    if base_px is None and open_prices_today is not None and ticker in open_prices_today.index:
+                        base_px = open_prices_today[ticker]
+                    if base_px is None or pd.isna(base_px):
+                        base_px = close_prices_today.get(ticker, np.nan)
+                    holdings_cycle_open_price.at[ticker] = float(base_px) if base_px is not None else np.nan
+                else:
+                    holdings_cycle_open_price.at[ticker] = np.nan
         if weight_update_today and current_target_weights is not None:
             prev_target_weights = current_target_weights.copy()
 
-        portfolio_value = float((holdings * close_prices_today).sum() + cash_balance)
+        if next_day_price is not None:
+            valuation_prices = next_day_price.copy()
+            if open_prices is not None:
+                try:
+                    next_day_open = open_prices.loc[trading_days[idx + 1]]
+                    valuation_prices = next_day_open.reindex(valuation_prices.index).fillna(valuation_prices)
+                except KeyError:
+                    pass
+            valuation_prices = valuation_prices.reindex(holdings.index).fillna(close_prices_today.reindex(holdings.index))
+        else:
+            valuation_prices = pd.Series(index=holdings.index, dtype=float)
+            for ticker in holdings.index:
+                price = close_prices_today.get(ticker, np.nan)
+                shares = float(holdings.at[ticker])
+                entry_ts = holdings_entry_date.at[ticker]
+                if shares > 0 and not pd.isna(entry_ts) and entry_ts == day:
+                    cost_basis = float(holdings_cost.at[ticker])
+                    price = cost_basis / shares if shares > 0 else price
+                valuation_prices.at[ticker] = price
+        portfolio_value = float((holdings * valuation_prices).sum() + cash_balance)
         portfolio_records.append({"Date": day, "Portfolio Value": portfolio_value})
 
     portfolio_df = pd.DataFrame(portfolio_records).set_index("Date")
@@ -596,9 +704,6 @@ def backtest_portfolio(
     portfolio_df["Portfolio Return"] = (
         portfolio_df["Portfolio Value"].pct_change().fillna(0.0)
     )
-
-    portfolio_returns = portfolio_df["Portfolio Return"]
-    metrics = compute_performance_metrics(portfolio_returns) if not portfolio_returns.empty else {}
 
     benchmark_curve = None
     benchmark_metrics = None
@@ -638,6 +743,7 @@ def backtest_portfolio(
 
     final_day = trading_days[-1]
     final_prices = close_prices.loc[final_day]
+
     holdings_snapshot = (
         holdings[holdings.abs() > 1e-9]
         .to_frame(name="Shares")
@@ -672,17 +778,34 @@ def backtest_portfolio(
     if missing_price_notes:
         missing_price_notes = list(dict.fromkeys(missing_price_notes))
 
+    effective_final_value = float(initial_capital + realized_pnl + unrealized_pnl)
+    effective_return_amount = float(realized_pnl + unrealized_pnl)
+    effective_return_pct = (
+        effective_return_amount / float(initial_capital) if initial_capital else float("nan")
+    )
+
+    if not portfolio_df.empty:
+        portfolio_df.at[portfolio_df.index[-1], "Portfolio Value"] = effective_final_value
+        portfolio_df["Portfolio Return"] = portfolio_df["Portfolio Value"].pct_change().fillna(0.0)
+
+    portfolio_returns = portfolio_df["Portfolio Return"]
+    metrics = compute_performance_metrics(portfolio_returns) if not portfolio_returns.empty else {}
+
     summary = {
         "initial_capital": float(initial_capital),
-        "final_value": float(portfolio_df["Portfolio Value"].iloc[-1]),
-        "return_amount": float(portfolio_df["Portfolio Value"].iloc[-1] - initial_capital),
-        "return_pct": float(portfolio_df["Portfolio Value"].iloc[-1] / initial_capital - 1),
+        "invested_capital": float(initial_capital - total_transaction_cost),
+        "final_value": effective_final_value,
+        "return_amount": effective_return_amount,
+        "return_pct": effective_return_pct,
         "rebalance_count": len(executed_rebalance_dates),
         "start_date": portfolio_df.index[0],
         "end_date": portfolio_df.index[-1],
         "ending_cash": float(cash_balance),
         "calendar_notes": calendar_notes,
         "missing_price_notes": missing_price_notes,
+        "transaction_cost_total": float(total_transaction_cost),
+        "realized_pnl": float(realized_pnl),
+        "unrealized_pnl": float(unrealized_pnl),
     }
 
     return {

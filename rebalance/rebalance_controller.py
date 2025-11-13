@@ -263,7 +263,6 @@ def run_rebalance_cycle(
             pd.to_numeric(final_portfolio_df["Strategy_Score"], errors="coerce")
             .fillna(0.0)
         )
-
     expected_returns_df: pd.DataFrame | None = None
     expected_returns_series: pd.Series | None = None
     forecast_exclusions: list[str] = []
@@ -414,7 +413,9 @@ def run_rebalance_cycle(
             preserve_cols = ["Ticker", "Weight"] + [col for col in new_allocation.columns if col not in {"Ticker", "Weight"}]
             new_allocation = (
                 new_allocation.loc[:, preserve_cols]
-                .sort_values(["Ticker"] + ([ "Date"] if "Date" in new_allocation.columns else []))
+                .sort_values(
+                    ["Ticker"] + (["Date"] if "Date" in new_allocation.columns else [])
+                )
                 .groupby("Ticker", as_index=False, sort=False)
                 .last()
             )

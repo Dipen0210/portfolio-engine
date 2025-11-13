@@ -320,6 +320,7 @@ if "portfolio_state" not in st.session_state:
     st.session_state["portfolio_state"] = PortfolioState(cash=capital)
 
 if st.sidebar.button("Reset Portfolio State"):
+    st.session_state.clear()
     st.session_state["portfolio_state"] = PortfolioState(cash=capital)
     st.rerun()
 
@@ -486,8 +487,6 @@ if run_button:
         summary_items = [
             ("Strategy", results["strategy_name"]),
             ("Risk Level", risk_level),
-            ("Cycle Equity ($)", f"{cycle_equity:,.0f}"),
-            ("Post-Trade Equity ($)", f"{post_trade_equity:,.0f}"),
             ("Start", strategy_start_label),
             ("As of", execution_label),
             ("Data Through", analysis_label),
@@ -665,7 +664,9 @@ if run_button:
         def _fmt_pct(value):
             return "N/A" if value is None or pd.isna(value) else f"{value * 100:.2f}%"
 
-        invested_amt = backtest_summary.get("initial_capital")
+        invested_amt = backtest_summary.get(
+            "invested_capital", backtest_summary.get("initial_capital")
+        )
         final_amt = backtest_summary.get("final_value")
         ret_amt = backtest_summary.get("return_amount")
         ret_pct = backtest_summary.get("return_pct")
@@ -864,12 +865,64 @@ if run_button:
                     "Backtest unavailable. Ensure sufficient price history and weights, then rerun."
                 )
         else:
-            backtest_summary_cols = st.columns(5)
-            backtest_summary_cols[0].metric("Invested", _fmt_dollar(invested_amt))
-            backtest_summary_cols[1].metric("Final Value", _fmt_dollar(final_amt))
-            backtest_summary_cols[2].metric("P/L", _fmt_dollar(ret_amt))
-            backtest_summary_cols[3].metric("Return %", _fmt_pct(ret_pct))
-            backtest_summary_cols[4].metric("Rebalances", str(int(rebalance_count)))
+            backtest_summary_cols = st.columns(4)
+            cash_amt = backtest_summary.get("ending_cash")
+            current_position_amt = final_amt
+            if current_position_amt is not None and cash_amt is not None:
+                current_position_amt = current_position_amt - cash_amt
+            else:
+                current_position_amt = invested_amt
+            backtest_summary_cols[0].metric(
+                "Current Position", _fmt_dollar(current_position_amt)
+            )
+            backtest_summary_cols[1].metric("P/L", _fmt_dollar(ret_amt))
+            backtest_summary_cols[2].metric("Return %", _fmt_pct(ret_pct))
+            backtest_summary_cols[3].metric("Rebalances", str(int(rebalance_count)))
+
+            cycle_log = st.session_state.setdefault("cycle_pnl_log", [])
+            realized_amt = backtest_summary.get("realized_pnl")
+            unrealized_amt = backtest_summary.get("unrealized_pnl")
+            if execution_label and execution_label != "-":
+                entry = {
+                    "Execution Date": execution_label,
+                    "Realized P/L": realized_amt if realized_amt is not None else 0.0,
+                    "Unrealized P/L": unrealized_amt if unrealized_amt is not None else 0.0,
+                }
+                existing = next(
+                    (row for row in cycle_log if row["Execution Date"] == execution_label),
+                    None,
+                )
+                if existing:
+                    existing.update(entry)
+                else:
+                    cycle_log.append(entry)
+            cumulative_realized = (
+                sum(row.get("Realized P/L", 0.0) for row in cycle_log)
+                if cycle_log
+                else realized_amt
+            )
+            latest_unrealized = (
+                next(
+                    (row.get("Unrealized P/L") for row in reversed(cycle_log)),
+                    unrealized_amt,
+                )
+                if cycle_log
+                else unrealized_amt
+            )
+            pnl_cols = st.columns(4)
+            txn_cost_amt = backtest_summary.get("transaction_cost_total")
+            if cumulative_realized is not None:
+                pnl_cols[0].metric("Cumulative Realized P/L", _fmt_dollar(cumulative_realized))
+            if latest_unrealized is not None:
+                pnl_cols[1].metric("Unrealized P/L", _fmt_dollar(latest_unrealized))
+            if txn_cost_amt is not None:
+                pnl_cols[2].metric("Transaction Costs", _fmt_dollar(-txn_cost_amt))
+            if cash_amt is not None:
+                pnl_cols[3].metric("Cash", _fmt_dollar(cash_amt))
+            if cycle_log:
+                st.write("### Cycle P/L Log")
+                log_df = pd.DataFrame(cycle_log).sort_values("Execution Date")
+                st.dataframe(log_df, hide_index=True)
 
             if rebalance_count == 0:
                 st.caption(
