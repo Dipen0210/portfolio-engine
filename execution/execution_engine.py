@@ -19,7 +19,11 @@ def snapshot_prices(price_data_dict: dict) -> dict:
     return snap
 
 
-def target_shares_from_weights(target_weights: pd.DataFrame, prices: dict, equity: float) -> dict:
+def target_shares_from_weights(
+    target_weights: pd.DataFrame,
+    prices: dict,
+    equity: float,
+) -> dict:
     """
     Convert target weights to integer share targets.
     target_weights: DataFrame with ['Ticker','Weight'] summing to 1
@@ -34,10 +38,8 @@ def target_shares_from_weights(target_weights: pd.DataFrame, prices: dict, equit
             continue
         notional = equity * w
         qty = int(notional // p)  # floor to whole shares
-        if qty > 0:
-            targets[t] = qty
-        else:
-            targets[t] = 0
+        targets[t] = max(qty, 0)
+
     return targets
 
 
@@ -58,7 +60,11 @@ def reconcile_orders(state: PortfolioState, target_shares: dict) -> pd.DataFrame
             orders.append({"Ticker": t, "Side": "BUY", "Qty": delta})
         elif delta < 0:
             orders.append({"Ticker": t, "Side": "SELL", "Qty": abs(delta)})
-    return pd.DataFrame(orders)
+    if not orders:
+        return pd.DataFrame()
+    return pd.DataFrame(orders).sort_values(
+        by="Side", key=lambda col: col != "SELL"
+    ).reset_index(drop=True)
 
 
 def execute_orders(state: PortfolioState,
@@ -86,12 +92,28 @@ def execute_orders(state: PortfolioState,
 
         # Slippage-adjusted fill
         fill_price = apply_slippage(mid, side, slippage_bps=slippage_bps)
-        gross = fill_price * qty * (1 if side == "SELL" else -1)
 
-        # Commission on notional (absolute)
-        commission = calc_commission(order_value=fill_price * qty,
-                                     per_trade=commission_per_trade,
-                                     bps=commission_bps)
+        if side == "BUY":
+            while qty > 0:
+                commission = calc_commission(
+                    order_value=fill_price * qty,
+                    per_trade=commission_per_trade,
+                    bps=commission_bps,
+                )
+                total_cost = fill_price * qty + commission
+                if total_cost <= state.cash + 1e-8:
+                    break
+                qty -= 1
+            if qty == 0:
+                continue
+        else:
+            commission = calc_commission(
+                order_value=fill_price * qty,
+                per_trade=commission_per_trade,
+                bps=commission_bps,
+            )
+
+        gross = fill_price * qty * (1 if side == "SELL" else -1)
 
         # Net cash impact
         # SELL: cash in (gross positive) - commission; BUY: negative - commission
