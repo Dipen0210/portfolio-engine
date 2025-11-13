@@ -1,7 +1,7 @@
 """
-signals/filters.py
--------------------
-Filters for initial stock selection based on sector and market cap.
+hardfilters/equities.py
+-----------------------
+Filters for initial equity selection based on sector and market cap.
 MVP version — uses only company.csv (no OHLCV or fundamentals yet).
 """
 

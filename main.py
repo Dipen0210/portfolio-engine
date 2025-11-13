@@ -10,6 +10,11 @@ from pandas.tseries.holiday import USFederalHolidayCalendar
 from execution.execution_engine import run_rebalance_cycle as execute_rebalance
 from execution.portfolio_state import PortfolioState
 from hardfilters.data_utils import load_company_universe
+from hardfilters.forex import (
+    available_base_currencies,
+    list_pairs_for_bases,
+    load_forex_universe,
+)
 from rebalance.rebalance_controller import run_rebalance_cycle
 
 # ---------------------------------------------------------
@@ -23,15 +28,9 @@ st.title("📊 smallQ: Integrated Portfolio Manager")
 # ---------------------------------------------------------
 st.sidebar.header("User Input")
 
-
 def load_company_data():
     return load_company_universe()
 
-
-company_universe = load_company_data()
-
-if company_universe.empty:
-    st.error("Company universe is empty. Please verify the dataset.")
 
 strategy = st.sidebar.selectbox(
     "Select Strategy", ["Momentum", "Mean Reversion", "Value", "Growth", "Quality"]
@@ -53,18 +52,81 @@ if as_of_date.date() > today.date():
     as_of_date = datetime.combine(today.date(), datetime.min.time())
 st.sidebar.caption("Lookback window is determined automatically by the chosen strategy.")
 
-# Sector selection
-available_sectors = sorted(
-    company_universe["sector"].dropna().unique().tolist()
-)
+# Asset class selection (controls downstream filters)
+ASSET_CLASS_OPTIONS = ["Equities", "Fixed Income", "Commodities", "Forex", "Crypto"]
+asset_class = st.sidebar.selectbox("Asset Class", ASSET_CLASS_OPTIONS, index=0)
+equities_selected = asset_class == "Equities"
+forex_selected = asset_class == "Forex"
+if not equities_selected:
+    if forex_selected:
+        st.sidebar.info("Forex workflow preview: select one or more base currencies to expand all supported pairs.")
+        st.info("💱 Forex analytics are in progress. Pair selection is available today; portfolio construction is coming soon.")
+    else:
+        st.sidebar.info("Multi-asset support is coming soon. Switch back to Equities to configure the existing workflow.")
+        st.info("🚧 Multi-asset workflows are under construction. Select Equities to access the full configuration experience.")
 
-if available_sectors:
-    sectors = st.sidebar.multiselect(
-        "Select Sectors", available_sectors, default=[]
-    )
+if equities_selected:
+    company_universe = load_company_data()
+    if company_universe.empty:
+        st.error("Company universe is empty. Please verify the dataset.")
 else:
-    st.sidebar.warning("No sectors available in the company universe.")
-    sectors = []
+    company_universe = pd.DataFrame()
+
+if not forex_selected:
+    st.session_state.pop("forex_symbols", None)
+
+selected_forex_bases: list[str] = []
+forex_pairs_df: pd.DataFrame | None = None
+if forex_selected:
+    try:
+        forex_universe = load_forex_universe()
+    except FileNotFoundError as exc:
+        st.sidebar.error(str(exc))
+        st.session_state.pop("forex_symbols", None)
+    else:
+        base_options = available_base_currencies(forex_universe)
+        if base_options:
+            selected_forex_bases = st.sidebar.multiselect(
+                "Base Currencies",
+                base_options,
+                key="forex_base_currencies",
+            )
+            if selected_forex_bases:
+                forex_pairs_df = list_pairs_for_bases(selected_forex_bases, data=forex_universe)
+                if forex_pairs_df.empty:
+                    st.sidebar.warning("No FX pairs available for the selected base currencies.")
+                    st.session_state.pop("forex_symbols", None)
+                else:
+                    forex_symbols = forex_pairs_df["YF_SYMBOL"].tolist()
+                    st.session_state["forex_symbols"] = forex_symbols
+                    base_list = ", ".join(sorted(set(selected_forex_bases)))
+                    st.sidebar.caption(
+                        f"{len(forex_symbols)} FX pairs generated for base currencies: {base_list}"
+                    )
+            else:
+                st.sidebar.caption("Select one or more base currencies to generate FX pairs.")
+                st.session_state.pop("forex_symbols", None)
+        else:
+            st.sidebar.warning("No base currencies available in the FX universe.")
+
+# Sector selection (visible only for equities workflow)
+available_sectors: list[str] = []
+sectors: list[str] = []
+if equities_selected:
+    if company_universe.empty:
+        st.sidebar.warning("Company universe unavailable—sector selection disabled.")
+    else:
+        available_sectors = sorted(
+            company_universe["sector"].dropna().unique().tolist()
+        )
+        if available_sectors:
+            sectors = st.sidebar.multiselect(
+                "Select Sectors", available_sectors, default=[]
+            )
+        else:
+            st.sidebar.warning("No sectors available in the company universe.")
+else:
+    st.sidebar.caption("Select the Equities asset class to enable sector filtering.")
 
 rebalance_options = {"Monthly": "M", "Weekly": "W"}
 rebalance_choice = st.sidebar.selectbox(
@@ -261,7 +323,7 @@ if st.sidebar.button("Reset Portfolio State"):
     st.session_state["portfolio_state"] = PortfolioState(cash=capital)
     st.rerun()
 
-run_button = st.sidebar.button("🚀 Run Rebalance Cycle")
+run_button = st.sidebar.button("🚀 Run Rebalance Cycle", disabled=not equities_selected)
 
 # ---------------------------------------------------------
 # Execute Rebalance
@@ -736,6 +798,7 @@ if run_button:
                 "TradeValue",
                 "CashFlow",
                 "Transaction Cost",
+                "RemainingCash",
             ]
             for col in numeric_cols:
                 if col in display_tx.columns:
@@ -756,6 +819,7 @@ if run_button:
                 "TradeValue",
                 "Transaction Cost",
                 "CashFlow",
+                "RemainingCash",
             ]
             display_tx = display_tx[
                 [c for c in column_order if c in display_tx.columns]

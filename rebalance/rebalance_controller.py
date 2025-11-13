@@ -8,7 +8,7 @@ from typing import Dict, Iterable
 import pandas as pd
 import yfinance as yf
 
-from hardfilters.filters import filter_universe_by_risk_and_sector
+from hardfilters.equities import filter_universe_by_risk_and_sector
 from strategies.registry import resolve_strategy
 from forecasting.forecast import compute_expected_returns
 from risk.risk_models import compute_log_returns, compute_covariance_matrix
@@ -21,6 +21,9 @@ from signals.signal_engine import generate_portfolio_signals
 DEFAULT_TOP_N_PER_SECTOR = 10
 FINAL_SELECTION_PER_SECTOR = 3
 BENCHMARK_TICKER = "^GSPC"
+BACKTEST_COMMISSION_PER_TRADE = 1.0
+BACKTEST_COMMISSION_BPS = 0.0
+BACKTEST_SLIPPAGE_BPS = 5.0
 
 
 def _ensure_datetime(value):
@@ -529,6 +532,9 @@ def run_rebalance_cycle(
                             benchmark_df=benchmark_df,
                             start_date=backtest_start_dt,
                             end_date=backtest_end_dt,
+                            commission_per_trade=BACKTEST_COMMISSION_PER_TRADE,
+                            commission_bps=BACKTEST_COMMISSION_BPS,
+                            slippage_bps=BACKTEST_SLIPPAGE_BPS,
                         )
                     except Exception as exc:
                         backtest_results = None
@@ -559,6 +565,9 @@ def run_rebalance_cycle(
                         benchmark_df=benchmark_df,
                         start_date=backtest_start_dt,
                         end_date=backtest_end_dt,
+                        commission_per_trade=BACKTEST_COMMISSION_PER_TRADE,
+                        commission_bps=BACKTEST_COMMISSION_BPS,
+                        slippage_bps=BACKTEST_SLIPPAGE_BPS,
                     )
                 except Exception as exc:
                     backtest_results = None
@@ -586,15 +595,18 @@ def run_rebalance_cycle(
                 if backtest_price_history:
                     try:
                         backtest_results = backtest_portfolio(
-                        backtest_price_history,
-                        candidate_allocation,
-                        trade_log_df=trade_log_df if not trade_log_df.empty else None,
-                        rebalance_freq=backtest_rebalance_freq,
-                        initial_capital=capital,
-                        benchmark_df=benchmark_df,
-                        start_date=backtest_start_dt,
-                        end_date=backtest_end_dt,
-                    )
+                            backtest_price_history,
+                            candidate_allocation,
+                            trade_log_df=trade_log_df if not trade_log_df.empty else None,
+                            rebalance_freq=backtest_rebalance_freq,
+                            initial_capital=capital,
+                            benchmark_df=benchmark_df,
+                            start_date=backtest_start_dt,
+                            end_date=backtest_end_dt,
+                            commission_per_trade=BACKTEST_COMMISSION_PER_TRADE,
+                            commission_bps=BACKTEST_COMMISSION_BPS,
+                            slippage_bps=BACKTEST_SLIPPAGE_BPS,
+                        )
                     except Exception as exc:
                         backtest_results = None
                         if backtest_error is None:

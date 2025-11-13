@@ -1,7 +1,11 @@
 # backtesting/backtester.py
-import pandas as pd
-import numpy as np
 import math
+
+import numpy as np
+import pandas as pd
+
+from execution.transaction_cost import calc_commission, apply_slippage
+
 from .metrics import compute_performance_metrics
 
 
@@ -35,6 +39,9 @@ def backtest_portfolio(
     benchmark_df: pd.DataFrame | None = None,
     start_date=None,
     end_date=None,
+    commission_per_trade: float = 1.0,
+    commission_bps: float = 0.0,
+    slippage_bps: float = 5.0,
 ):
     """
     Simulate a rebalancing backtest with explicit transaction logging.
@@ -59,6 +66,12 @@ def backtest_portfolio(
         Inclusive backtest start.
     end_date : datetime/date/str, optional
         Inclusive backtest end.
+    commission_per_trade : float, optional
+        Flat commission applied to every order (default $1).
+    commission_bps : float, optional
+        Additional commission expressed in basis points of notional.
+    slippage_bps : float, optional
+        Slippage applied to fills (default 5 bps).
 
     Returns
     -------
@@ -439,6 +452,7 @@ def backtest_portfolio(
                 target_shares_map[ticker] = _round_down_shares(desired_shares)
 
             day_transactions: list[dict] = []
+            cash_pointer = cash_balance
             for ticker in holdings.index:
                 close_price = close_prices_today[ticker]
                 if pd.isna(close_price) or close_price <= 0:
@@ -466,8 +480,15 @@ def backtest_portfolio(
 
                 action = "BUY" if delta_shares > 0 else "SELL"
                 shares_traded = abs(delta_shares)
-                trade_value = shares_traded * trade_price
+                fill_price = apply_slippage(trade_price, action, slippage_bps=slippage_bps)
+                trade_value = shares_traded * fill_price
+                commission = calc_commission(
+                    order_value=trade_value,
+                    per_trade=commission_per_trade,
+                    bps=commission_bps,
+                )
                 cash_flow = -trade_value if action == "BUY" else trade_value
+                transaction_cost = -commission
 
                 actual_old_weight = (old_shares * close_price) / base_value if base_value > 0 else 0.0
                 actual_new_weight = (target_shares * close_price) / base_value if base_value > 0 else 0.0
@@ -531,6 +552,7 @@ def backtest_portfolio(
                     if "Timestamp" in log_entry and pd.notna(log_entry["Timestamp"]):
                         recorded_timestamp = pd.to_datetime(log_entry["Timestamp"])
 
+                cash_pointer += cash_flow + transaction_cost
                 day_transactions.append(
                     {
                         "Date": day,
@@ -539,9 +561,11 @@ def backtest_portfolio(
                         "Action": action,
                         "Signal": recorded_signal,
                         "Shares": shares_traded,
-                        "Price": trade_price,
+                        "Price": fill_price,
                         "TradeValue": trade_value,
                         "CashFlow": cash_flow,
+                        "Transaction Cost": transaction_cost,
+                        "RemainingCash": cash_pointer,
                         "Old_Weight": recorded_old_weight,
                         "New_Weight": recorded_new_weight,
                         "Net_Weight": recorded_new_weight - recorded_old_weight,
@@ -552,11 +576,12 @@ def backtest_portfolio(
                 holdings.at[ticker] = max(target_shares, 0.0)
 
             if day_transactions:
-                total_cash_flow = sum(tx["CashFlow"] for tx in day_transactions)
+                total_cash_flow = sum(
+                    tx["CashFlow"] + tx.get("Transaction Cost", 0.0)
+                    for tx in day_transactions
+                )
                 cash_balance += total_cash_flow
-                holdings_value = float((holdings * close_prices_today).sum())
-                cash_balance = base_value - holdings_value
-                if cash_balance < 0 and abs(cash_balance) <= 1e-6:
+                if abs(cash_balance) <= 1e-9:
                     cash_balance = 0.0
                 transactions.extend(day_transactions)
                 executed_rebalance_dates.append(day)
@@ -595,14 +620,20 @@ def backtest_portfolio(
     transactions_df = pd.DataFrame(transactions)
     if not transactions_df.empty:
         transactions_df["Date"] = pd.to_datetime(transactions_df["Date"])
-        for col in ["Shares", "Price", "TradeValue", "CashFlow", "Old_Weight", "New_Weight", "Net_Weight"]:
+        for col in [
+            "Shares",
+            "Price",
+            "TradeValue",
+            "CashFlow",
+            "Transaction Cost",
+            "RemainingCash",
+            "Old_Weight",
+            "New_Weight",
+            "Net_Weight",
+        ]:
             transactions_df[col] = pd.to_numeric(transactions_df[col], errors="coerce")
         if "Timestamp" in transactions_df.columns:
             transactions_df["Timestamp"] = pd.to_datetime(transactions_df["Timestamp"])
-        transactions_df["Transaction Cost"] = (
-            transactions_df["TradeValue"].abs() - transactions_df["CashFlow"].abs()
-        )
-        transactions_df["Transaction Cost"] = transactions_df["Transaction Cost"].round(4)
         transactions_df = transactions_df.sort_values(["Date", "Event", "Ticker"]).reset_index(drop=True)
 
     final_day = trading_days[-1]
