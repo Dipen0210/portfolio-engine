@@ -6,6 +6,8 @@ import math
 
 import pandas as pd
 
+from utils.formatting import truncate_value
+
 from .indicators import EMA, MACD, RSI, SMA
 
 
@@ -69,7 +71,8 @@ def calculate_momentum_score(df: pd.DataFrame) -> float:
     score_macd = _clip(macd_hist / macd_denom)
 
     aggregate = (score_return + score_trend + score_rsi + score_macd) / 4.0
-    return float(round(aggregate, 4))
+    truncated = truncate_value(aggregate, decimals=4)
+    return 0.0 if truncated is None else float(truncated)
 
 
 def run_momentum_strategy(stock_data_dict: dict[str, pd.DataFrame]) -> pd.DataFrame:

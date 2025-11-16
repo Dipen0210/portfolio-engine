@@ -3,6 +3,8 @@ import streamlit as st
 import matplotlib.pyplot as plt
 import pandas as pd
 
+from utils.formatting import format_percentage
+
 
 def plot_equity_curve(portfolio_state):
     df = portfolio_state.portfolio_value_history.copy()
@@ -21,4 +23,5 @@ def plot_equity_curve(portfolio_state):
 def display_metrics_table(metrics_dict):
     df = pd.DataFrame(metrics_dict, index=["Metrics"]).T
     df.columns = ["Value"]
-    st.table(df.style.format("{:.2%}", subset=["Value"]))
+    df["Value"] = df["Value"].apply(format_percentage)
+    st.table(df)

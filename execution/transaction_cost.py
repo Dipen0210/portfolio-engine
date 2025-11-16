@@ -1,12 +1,12 @@
 # execution/transaction_costs.py
-def calc_commission(order_value: float, per_trade: float = 1.0, bps: float = 0.0) -> float:
+def calc_commission(order_value: float = 0.0, per_trade: float = 1.0, bps: float = 0.0) -> float:
     """
     Commission as flat fee + basis points of notional.
     """
-    return per_trade + (bps / 10_000.0) * abs(order_value)
+    return per_trade
 
 
-def apply_slippage(mid_price: float, side: str, slippage_bps: float = 5.0) -> float:
+def apply_slippage(mid_price: float, side: str, slippage_bps: float = 0.0) -> float:
     """
     Shift fill price by slippage (bps). Buy -> worse (higher), Sell -> worse (lower).
     """
