@@ -1,65 +1,76 @@
 # execution/execution_engine.py
-import pandas as pd
-import numpy as np
+from __future__ import annotations
+
 from datetime import datetime
+
+import numpy as np
+import pandas as pd
+
 from .portfolio_state import PortfolioState
-from .transaction_cost import calc_commission, apply_slippage
+from utils.formatting import truncate_value
 
 
-def snapshot_prices(price_data_dict: dict) -> dict:
+def snapshot_prices(price_data_dict: dict, trading_date) -> dict[str, float]:
     """
-    Get latest close/last for each ticker from your OHLCV dict.
-    price_data_dict: {ticker: df with 'Close'}
-    returns: {ticker: last_price}
+    Build an execution snapshot of opening prices for the supplied trading date.
     """
-    snap = {}
-    for t, df in price_data_dict.items():
-        if "Close" in df.columns and len(df) > 0:
-            snap[t] = float(df["Close"].iloc[-1])
-    return snap
+    ts = pd.Timestamp(trading_date).normalize()
+    snapshot: dict[str, float] = {}
+    for ticker, df in price_data_dict.items():
+        if df is None or df.empty:
+            continue
+        working = df.copy()
+        if "Date" in working.columns:
+            working["Date"] = pd.to_datetime(working["Date"], errors="coerce").dt.normalize()
+            matches = working[working["Date"] == ts]
+        else:
+            working.index = pd.to_datetime(working.index)
+            matches = working.loc[working.index.normalize() == ts]
+        if matches.empty or "Open" not in matches.columns:
+            continue
+        snapshot[ticker] = float(matches["Open"].iloc[-1])
+    if not snapshot:
+        raise ValueError(f"No open prices available on {ts.date()} for the provided tickers.")
+    return snapshot
 
 
 def target_shares_from_weights(
     target_weights: pd.DataFrame,
-    prices: dict,
+    prices: dict[str, float],
     equity: float,
-) -> dict:
+) -> dict[str, float]:
     """
-    Convert target weights to integer share targets.
-    target_weights: DataFrame with ['Ticker','Weight'] summing to 1
-    prices: {ticker: price}
-    equity: total portfolio equity (cash + positions marked)
+    Convert target weights to fractional share targets using execution-day open prices.
     """
-    targets = {}
+    targets: dict[str, float] = {}
     for _, row in target_weights.iterrows():
-        t, w = row["Ticker"], float(row["Weight"])
-        p = prices.get(t, np.nan)
-        if np.isnan(p) or p <= 0:
-            continue
-        notional = equity * w
-        qty = int(notional // p)  # floor to whole shares
-        targets[t] = max(qty, 0)
-
+        ticker = row["Ticker"]
+        weight = float(row["Weight"])
+        price = prices.get(ticker)
+        if price is None or np.isnan(price) or price <= 0:
+            raise ValueError(f"Missing open price for {ticker}; unable to size target shares.")
+        notional = equity * weight
+        qty = truncate_value(notional / price, decimals=4)
+        targets[ticker] = max(qty, 0.0)
     return targets
 
 
-def reconcile_orders(state: PortfolioState, target_shares: dict) -> pd.DataFrame:
+def reconcile_orders(state: PortfolioState, target_shares: dict[str, float]) -> pd.DataFrame:
     """
-    Create order list by comparing current positions vs target shares.
-    Returns DataFrame: ['Ticker','Side','Qty']
+    Create order instructions by comparing existing holdings vs desired share counts.
     """
-    orders = []
+    orders: list[dict] = []
     current = state.positions.copy()
-
     tickers = set(current.keys()) | set(target_shares.keys())
-    for t in tickers:
-        cur = int(current.get(t, 0))
-        tgt = int(target_shares.get(t, 0))
-        delta = tgt - cur
-        if delta > 0:
-            orders.append({"Ticker": t, "Side": "BUY", "Qty": delta})
-        elif delta < 0:
-            orders.append({"Ticker": t, "Side": "SELL", "Qty": abs(delta)})
+    for ticker in tickers:
+        current_qty = float(current.get(ticker, 0.0))
+        target_qty = float(target_shares.get(ticker, 0.0))
+        delta = target_qty - current_qty
+        if delta > 1e-8:
+            orders.append({"Ticker": ticker, "Side": "BUY", "Qty": delta})
+        elif delta < -1e-8:
+            orders.append({"Ticker": ticker, "Side": "SELL", "Qty": abs(delta)})
+
     if not orders:
         return pd.DataFrame()
     return pd.DataFrame(orders).sort_values(
@@ -67,122 +78,101 @@ def reconcile_orders(state: PortfolioState, target_shares: dict) -> pd.DataFrame
     ).reset_index(drop=True)
 
 
-def execute_orders(state: PortfolioState,
-                   orders_df: pd.DataFrame,
-                   prices: dict,
-                   date=None,
-                   commission_per_trade: float = 1.0,
-                   commission_bps: float = 0.0,
-                   slippage_bps: float = 5.0):
+def execute_orders(
+    state: PortfolioState,
+    orders_df: pd.DataFrame,
+    prices: dict[str, float],
+    date=None,
+    commission_per_trade: float = 1.0,
+) -> None:
     """
-    Fills orders against current prices with slippage & commission, updates state.
+    Fill all orders at the execution-day open price and update portfolio accounting.
     """
-    if orders_df is None or len(orders_df) == 0:
+    if orders_df is None or orders_df.empty:
         return
 
-    date = date or datetime.now().strftime("%Y-%m-%d")
+    exec_date = date or datetime.now().strftime("%Y-%m-%d")
 
-    for _, od in orders_df.iterrows():
-        t = od["Ticker"]
-        side = od["Side"].upper()
-        qty = int(od["Qty"])
-        mid = float(prices.get(t, np.nan))
-        if np.isnan(mid) or qty <= 0:
+    for _, order in orders_df.iterrows():
+        ticker = order["Ticker"]
+        side = str(order["Side"]).upper()
+        qty = float(order["Qty"])
+        price = prices.get(ticker)
+        if price is None or np.isnan(price) or price <= 0 or qty <= 0:
             continue
 
-        # Slippage-adjusted fill
-        fill_price = apply_slippage(mid, side, slippage_bps=slippage_bps)
+        fee = commission_per_trade if commission_per_trade > 0 else 0.0
 
         if side == "BUY":
-            while qty > 0:
-                commission = calc_commission(
-                    order_value=fill_price * qty,
-                    per_trade=commission_per_trade,
-                    bps=commission_bps,
-                )
-                total_cost = fill_price * qty + commission
-                if total_cost <= state.cash + 1e-8:
-                    break
-                qty -= 1
-            if qty == 0:
+            available_cash = state.cash - fee
+            if available_cash <= 0:
                 continue
-        else:
-            commission = calc_commission(
-                order_value=fill_price * qty,
-                per_trade=commission_per_trade,
-                bps=commission_bps,
-            )
+            max_affordable = available_cash / price
+            max_affordable = truncate_value(max_affordable, decimals=4)
+            if max_affordable <= 0:
+                continue
+            qty = min(qty, max_affordable)
+            if qty <= 0:
+                continue
 
-        gross = fill_price * qty * (1 if side == "SELL" else -1)
+        qty_delta = qty if side == "BUY" else -qty
+        realized = state.update_position(ticker, qty_delta, price=price, side=side)
+        if fee > 0:
+            state.deduct_fee(fee)
 
-        # Net cash impact
-        # SELL: cash in (gross positive) - commission; BUY: negative - commission
-        net = gross - commission
-
-        # Update state
-        state.cash += net
-        state.update_position(t, qty if side == "BUY" else -qty)
-
-        # Log
-        state.append_trade({
-            "Date": date,
-            "Ticker": t,
-            "Side": side,
-            "Qty": qty,
-            "Price": round(fill_price, 6),
-            "Gross": round(gross, 2),
-            "Commission": round(commission, 2),
-            "Slippage": round((fill_price - mid) * (1 if side == "BUY" else -1) * qty, 2),
-            "Net": round(net, 2),
-        })
+        state.append_trade(
+            {
+                "Date": exec_date,
+                "Ticker": ticker,
+                "Side": side,
+                "Qty": truncate_value(qty, decimals=4),
+                "Price": truncate_value(price, decimals=4),
+                "Notional": truncate_value(price * qty, decimals=4),
+                "RealizedPnL": truncate_value(realized, decimals=4),
+                "Fee": truncate_value(fee, decimals=4),
+                "CashAfter": truncate_value(state.cash, decimals=4),
+            }
+        )
 
 
 def run_rebalance_cycle(
     state: PortfolioState,
     price_data_dict: dict,
-    # ['Ticker','Weight'] (weights sum ≈ 1)
     new_portfolio_weights: pd.DataFrame,
     date=None,
     commission_per_trade: float = 1.0,
-    commission_bps: float = 0.0,
-    slippage_bps: float = 5.0,
-):
+) -> pd.DataFrame:
     """
-    Master function for a rebalance:
-      1) Mark-to-market to compute equity
-      2) Convert target weights -> target shares
-      3) Create orders (delta shares)
-      4) Execute orders -> update state
-      5) Mark-to-market post-trade (optional)
-    Returns orders_df for inspection.
+    Execute a rebalance using target weights and execution-day open prices.
     """
-    date = date or (list(price_data_dict.values())[
-                    0].index[-1] if price_data_dict else None)
+    date = date or (list(price_data_dict.values())[0].index[-1] if price_data_dict else None)
+    if date is None:
+        raise ValueError("Execution date is required to perform a rebalance.")
 
-    # 1) Mark current equity
-    prices = snapshot_prices(price_data_dict)
-    equity = state.mark_to_market(date, prices)
+    open_prices = snapshot_prices(price_data_dict, date)
 
-    # 2) Target shares
-    tw = new_portfolio_weights.copy()
-    tw["Weight"] = tw["Weight"] / tw["Weight"].sum()  # ensure normalized
-    targets = target_shares_from_weights(tw, prices, equity)
+    equity = state.current_equity(open_prices)
 
-    # 3) Orders
+    weights = new_portfolio_weights.copy()
+    weights["Weight"] = pd.to_numeric(weights["Weight"], errors="coerce")
+    weights = weights.dropna(subset=["Weight"])
+    if weights.empty:
+        return pd.DataFrame(columns=["Ticker", "Side", "Qty"])
+    weights["Weight"] = weights["Weight"] / weights["Weight"].sum()
+    targets = target_shares_from_weights(weights, open_prices, equity)
+
     orders_df = reconcile_orders(state, targets)
-
-    # 4) Execute orders
     execute_orders(
         state=state,
         orders_df=orders_df,
-        prices=prices,
+        prices=open_prices,
         date=date,
         commission_per_trade=commission_per_trade,
-        commission_bps=commission_bps,
-        slippage_bps=slippage_bps,
     )
 
-    # 5) Post-trade mark
-    state.mark_to_market(date, prices)
-
+    state.mark_to_market(date, open_prices)
+    try:
+        state.last_price_snapshot = dict(open_prices)
+    except Exception:
+        state.last_price_snapshot = open_prices
     return orders_df

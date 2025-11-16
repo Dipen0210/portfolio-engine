@@ -11,6 +11,7 @@ from typing import Iterable
 
 import pandas as pd
 
+from utils.formatting import truncate_dataframe
 RISK_PERCENTILE_WINDOWS = {
     # Larger caps -> lower risk; smaller caps -> higher risk
     "low": (0.66, 1.0),
@@ -75,6 +76,7 @@ def apply_filters(company_df, sector=None, n=5, min_cap=None, max_cap=None):
     filtered = filter_by_sector(company_df, sector)
     filtered = filter_by_market_cap(filtered, min_cap, max_cap)
     selected = select_top_n(filtered, n)
+    selected = truncate_dataframe(selected, decimals=4)
 
     tickers = selected["ticker"].tolist()
     return selected, tickers
@@ -138,6 +140,6 @@ def filter_universe_by_risk_and_sector(
         canonical_sector = top_selection["sector"].iloc[0]
         top_selection = top_selection.copy()
         top_selection["sector"] = canonical_sector
-        sector_slices[canonical_sector] = top_selection
+        sector_slices[canonical_sector] = truncate_dataframe(top_selection, decimals=4)
 
     return sector_slices

@@ -17,13 +17,17 @@ from optimization.weight_optimizer import mean_variance_optimize
 from optimization.hybrid_allocator import allocate_hybrid_weights
 from backtesting.backtester import backtest_portfolio
 from signals.signal_engine import generate_portfolio_signals
+from utils.trading_calendar import next_trading_day, previous_trading_day
+from utils.formatting import (
+    normalize_and_truncate_weights,
+    truncate_dataframe,
+    truncate_series,
+)
 
 DEFAULT_TOP_N_PER_SECTOR = 10
 FINAL_SELECTION_PER_SECTOR = 3
 BENCHMARK_TICKER = "^GSPC"
-BACKTEST_COMMISSION_PER_TRADE = 1.0
-BACKTEST_COMMISSION_BPS = 0.0
-BACKTEST_SLIPPAGE_BPS = 5.0
+COMMISSION_PER_TRADE = 1.0
 
 
 def _ensure_datetime(value):
@@ -107,7 +111,6 @@ def run_rebalance_cycle(
     top_n_per_sector: int = DEFAULT_TOP_N_PER_SECTOR,
     top_k_final: int = FINAL_SELECTION_PER_SECTOR,
     backtest_rebalance_freq: str = "M",
-    drift_threshold: float = 0.03,
 ):
     """
     Build the candidate portfolio by filtering the universe, running the
@@ -124,8 +127,18 @@ def run_rebalance_cycle(
         2, lookback_window if lookback_window is not None else strategy_spec.lookback_window
     )
 
-    analysis_dt = _ensure_datetime(as_of_date) or datetime.today()
-    execution_dt = _ensure_datetime(execution_date) or analysis_dt
+    analysis_candidate = _ensure_datetime(as_of_date)
+    execution_candidate = _ensure_datetime(execution_date)
+    if execution_candidate is None:
+        base_dt = analysis_candidate or datetime.today()
+        base_ts = pd.Timestamp(base_dt).normalize() + pd.Timedelta(days=1)
+        execution_dt = next_trading_day(base_ts)
+    else:
+        execution_dt = next_trading_day(execution_candidate)
+    try:
+        analysis_dt = previous_trading_day(execution_dt)
+    except ValueError as exc:
+        raise ValueError("Unable to resolve a prior trading day for signal generation.") from exc
     requested_backtest_start = _ensure_datetime(backtest_start_date)
 
     if execution_dt < analysis_dt:
@@ -147,6 +160,7 @@ def run_rebalance_cycle(
     if not hasattr(state, "last_allocation"):
         state.last_allocation = previous_allocation.copy()
     trade_signals: pd.DataFrame | None = None
+    trade_log_df: pd.DataFrame | None = None
     # 1) Filter universe by sector and risk preferences.
     sector_slices = filter_universe_by_risk_and_sector(
         company_df=company_universe_df,
@@ -165,6 +179,7 @@ def run_rebalance_cycle(
         .sort_values(by=["sector", "market cap"], ascending=[True, False])
         .reset_index(drop=True)
     )
+    candidate_pool_df = truncate_dataframe(candidate_pool_df, decimals=4)
 
     previous_tickers: list[str] = []
     if previous_allocation is not None and not previous_allocation.empty:
@@ -263,6 +278,7 @@ def run_rebalance_cycle(
             pd.to_numeric(final_portfolio_df["Strategy_Score"], errors="coerce")
             .fillna(0.0)
         )
+    final_portfolio_df = truncate_dataframe(final_portfolio_df, decimals=4)
     expected_returns_df: pd.DataFrame | None = None
     expected_returns_series: pd.Series | None = None
     forecast_exclusions: list[str] = []
@@ -275,6 +291,7 @@ def run_rebalance_cycle(
     backtest_results: dict | None = None
     backtest_error: str | None = None
     allocation_carry_forward = False
+    fallback_equal_weight = False
     new_allocation = pd.DataFrame(columns=["Ticker", "Weight"])
 
     if not final_portfolio_df.empty:
@@ -290,6 +307,10 @@ def run_rebalance_cycle(
             expected_returns_df, expected_returns_series = compute_expected_returns(
                 selected_price_history, window=forecast_window
             )
+            if expected_returns_df is not None and not expected_returns_df.empty:
+                expected_returns_df = truncate_dataframe(expected_returns_df, decimals=4)
+            if expected_returns_series is not None and not expected_returns_series.empty:
+                expected_returns_series = truncate_series(expected_returns_series, decimals=4)
 
     if expected_returns_series is not None and not expected_returns_series.empty:
         available_tickers = expected_returns_series.index.tolist()
@@ -308,6 +329,8 @@ def run_rebalance_cycle(
                 cov_matrix = compute_covariance_matrix(returns_matrix, method="ledoit_wolf")
             else:
                 cov_matrix = pd.DataFrame()
+        if not cov_matrix.empty:
+            cov_matrix = truncate_dataframe(cov_matrix, decimals=4)
 
         if not cov_matrix.empty:
             try:
@@ -337,6 +360,9 @@ def run_rebalance_cycle(
             except ValueError:
                 optimized_weights = None
 
+        if optimized_weights is not None and not optimized_weights.empty:
+            optimized_weights = truncate_series(optimized_weights, decimals=4)
+
         if optimized_weights is not None and not final_portfolio_df.empty:
             try:
                 hybrid_allocation = allocate_hybrid_weights(
@@ -344,6 +370,11 @@ def run_rebalance_cycle(
                 )
             except Exception:
                 hybrid_allocation = None
+        if hybrid_allocation is not None and not hybrid_allocation.empty:
+            hybrid_allocation = normalize_and_truncate_weights(
+                hybrid_allocation, weight_col="Final_Weight", decimals=4
+            )
+            hybrid_allocation = truncate_dataframe(hybrid_allocation, decimals=4)
         weights_for_risk = None
         if hybrid_allocation is not None and not hybrid_allocation.empty:
             weights_for_risk = (
@@ -353,6 +384,19 @@ def run_rebalance_cycle(
             )
         elif optimized_weights is not None and not optimized_weights.empty:
             weights_for_risk = optimized_weights.reindex(price_matrix.columns).dropna()
+
+        if weights_for_risk is not None and not weights_for_risk.empty:
+            weights_for_risk_df = (
+                weights_for_risk.rename("Weight")
+                .reset_index()
+                .rename(columns={"index": "Ticker"})
+            )
+            weights_for_risk_df = normalize_and_truncate_weights(weights_for_risk_df, decimals=4)
+            weights_for_risk = (
+                weights_for_risk_df.set_index("Ticker")["Weight"]
+                .reindex(weights_for_risk.index)
+                .dropna()
+            )
 
         new_allocation = pd.DataFrame(columns=["Ticker", "Weight"])
         if weights_for_risk is not None and not weights_for_risk.empty:
@@ -399,6 +443,19 @@ def run_rebalance_cycle(
             except Exception:
                 risk_report = None
 
+        if new_allocation.empty and not final_portfolio_df.empty:
+            eq_source = (
+                final_portfolio_df.loc[:, ["Ticker"]]
+                .assign(Weight=1.0)
+                .groupby("Ticker", as_index=False)
+                .first()
+            )
+            eq_source["Weight"] = pd.to_numeric(eq_source["Weight"], errors="coerce").fillna(0.0)
+            eq_source = eq_source[eq_source["Ticker"].astype(str).str.strip() != ""]
+            if not eq_source.empty:
+                new_allocation = normalize_and_truncate_weights(eq_source, decimals=4)
+                fallback_equal_weight = True
+
         if not new_allocation.empty:
             new_allocation = new_allocation.copy()
             new_allocation["Ticker"] = new_allocation["Ticker"].astype(str).str.strip()
@@ -408,6 +465,7 @@ def run_rebalance_cycle(
             new_allocation = new_allocation.dropna(subset=["Ticker", "Weight"])
             new_allocation["Weight"] = pd.to_numeric(new_allocation["Weight"], errors="coerce")
             new_allocation = new_allocation.dropna(subset=["Weight"])
+            new_allocation = normalize_and_truncate_weights(new_allocation, decimals=4)
 
         if not new_allocation.empty:
             preserve_cols = ["Ticker", "Weight"] + [col for col in new_allocation.columns if col not in {"Ticker", "Weight"}]
@@ -441,7 +499,6 @@ def run_rebalance_cycle(
             trade_signals = generate_portfolio_signals(
                 previous_allocation,
                 new_allocation,
-                drift_threshold=drift_threshold,
                 as_of_date=analysis_dt,
             )
         except Exception:
@@ -449,8 +506,10 @@ def run_rebalance_cycle(
         else:
             if trade_signals is not None and not trade_signals.empty:
                 trade_signals = trade_signals.copy()
+                signal_date_str = analysis_dt.strftime("%Y-%m-%d")
                 trade_signals["Execution_Date"] = execution_dt.strftime("%Y-%m-%d")
-                trade_signals["Data_Through"] = analysis_dt.strftime("%Y-%m-%d")
+                trade_signals["Data_Through"] = signal_date_str
+                trade_signals["Signal_Date"] = signal_date_str
                 trade_signals["Date"] = trade_signals["Execution_Date"]
 
         state.last_allocation = new_allocation.copy()
@@ -487,13 +546,19 @@ def run_rebalance_cycle(
 
         if backtest_results is None and not trade_log_df.empty:
             if "Execution_Date" in trade_log_df.columns:
+                cols = ["Execution_Date", "Ticker", "New_Weight"]
+                if "Signal_Date" in trade_log_df.columns:
+                    cols.append("Signal_Date")
                 weight_history = (
-                    trade_log_df.loc[:, ["Execution_Date", "Ticker", "New_Weight"]]
+                    trade_log_df.loc[:, cols]
                     .rename(columns={"Execution_Date": "Date", "New_Weight": "Weight"})
                 )
             else:
+                cols = ["Date", "Ticker", "New_Weight"]
+                if "Signal_Date" in trade_log_df.columns:
+                    cols.append("Signal_Date")
                 weight_history = (
-                    trade_log_df.loc[:, ["Date", "Ticker", "New_Weight"]]
+                    trade_log_df.loc[:, cols]
                     .rename(columns={"New_Weight": "Weight"})
                 )
             weight_history["Date"] = pd.to_datetime(weight_history["Date"], errors="coerce")
@@ -517,30 +582,28 @@ def run_rebalance_cycle(
                         weight_history["Date"] <= pd.Timestamp(execution_dt)
                     ]
                 ticker_universe = weight_history["Ticker"].unique().tolist()
-                backtest_price_history = {
-                    ticker: price_history[ticker]
-                    for ticker in ticker_universe
-                    if ticker in price_history
-                }
-                if backtest_price_history:
-                    try:
-                        backtest_results = backtest_portfolio(
-                            backtest_price_history,
-                            weight_history,
-                            trade_log_df=trade_log_df,
-                            rebalance_freq=backtest_rebalance_freq,
-                            initial_capital=capital,
-                            benchmark_df=benchmark_df,
-                            start_date=backtest_start_dt,
-                            end_date=backtest_end_dt,
-                            commission_per_trade=BACKTEST_COMMISSION_PER_TRADE,
-                            commission_bps=BACKTEST_COMMISSION_BPS,
-                            slippage_bps=BACKTEST_SLIPPAGE_BPS,
-                        )
-                    except Exception as exc:
-                        backtest_results = None
-                        if backtest_error is None:
-                            backtest_error = str(exc) or exc.__class__.__name__
+            backtest_price_history = {
+                ticker: price_history[ticker]
+                for ticker in ticker_universe
+                if ticker in price_history
+            }
+            if backtest_price_history:
+                try:
+                    backtest_results = backtest_portfolio(
+                        backtest_price_history,
+                        weight_history,
+                        trade_log_df=trade_log_df if trade_log_df is not None and not trade_log_df.empty else None,
+                        rebalance_freq=backtest_rebalance_freq,
+                        initial_capital=capital,
+                        benchmark_df=benchmark_df,
+                        start_date=backtest_start_dt,
+                        end_date=backtest_end_dt,
+                        commission_per_trade=COMMISSION_PER_TRADE,
+                    )
+                except Exception as exc:
+                    backtest_results = None
+                    if backtest_error is None:
+                        backtest_error = str(exc) or exc.__class__.__name__
         if (
             backtest_results is None
             and weights_for_risk is not None
@@ -566,9 +629,7 @@ def run_rebalance_cycle(
                         benchmark_df=benchmark_df,
                         start_date=backtest_start_dt,
                         end_date=backtest_end_dt,
-                        commission_per_trade=BACKTEST_COMMISSION_PER_TRADE,
-                        commission_bps=BACKTEST_COMMISSION_BPS,
-                        slippage_bps=BACKTEST_SLIPPAGE_BPS,
+                        commission_per_trade=COMMISSION_PER_TRADE,
                     )
                 except Exception as exc:
                     backtest_results = None
@@ -604,9 +665,7 @@ def run_rebalance_cycle(
                             benchmark_df=benchmark_df,
                             start_date=backtest_start_dt,
                             end_date=backtest_end_dt,
-                            commission_per_trade=BACKTEST_COMMISSION_PER_TRADE,
-                            commission_bps=BACKTEST_COMMISSION_BPS,
-                            slippage_bps=BACKTEST_SLIPPAGE_BPS,
+                            commission_per_trade=COMMISSION_PER_TRADE,
                         )
                     except Exception as exc:
                         backtest_results = None
@@ -645,10 +704,11 @@ def run_rebalance_cycle(
         "trade_signals": trade_signals,
         "benchmark_history": benchmark_df,
         "current_allocation": new_allocation,
-        "trade_log": trade_log_df.copy(),
+        "trade_log": trade_log_df.copy() if trade_log_df is not None else pd.DataFrame(),
         "as_of_date": execution_dt.strftime("%Y-%m-%d"),
         "backtest_rebalance_freq": backtest_rebalance_freq,
         "strategy_lookback_window": strategy_lookback,
         "weights_as_of": analysis_last_date or cutoff_date,
         "carried_forward_allocation": allocation_carry_forward,
+        "fallback_equal_weight": fallback_equal_weight,
     }

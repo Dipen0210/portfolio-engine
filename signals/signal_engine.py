@@ -5,6 +5,8 @@ from datetime import datetime
 
 import pandas as pd
 
+from utils.formatting import normalize_and_truncate_weights, truncate_series
+
 from .signal_logger import log_signals
 
 
@@ -19,7 +21,6 @@ def _normalize_date(as_of_date) -> str:
 def generate_portfolio_signals(
     old_portfolio_df: pd.DataFrame | None,
     new_portfolio_df: pd.DataFrame,
-    drift_threshold: float = 0.03,
     as_of_date=None,
 ):
     """
@@ -31,9 +32,6 @@ def generate_portfolio_signals(
         Previous portfolio (Ticker, Weight)
     new_portfolio_df : pd.DataFrame
         New optimized portfolio (Ticker, Weight)
-    drift_threshold : float
-        % weight deviation allowed before triggering rebalance (default 3%)
-
     Returns
     -------
     signals_df : pd.DataFrame
@@ -57,6 +55,8 @@ def generate_portfolio_signals(
             .groupby("Ticker", as_index=False, sort=False)
             .last()
         )
+        working = normalize_and_truncate_weights(working, decimals=4)
+        working["Weight"] = truncate_series(working["Weight"], decimals=4)
         return working[["Ticker", "Weight"]]
 
     results = []
@@ -154,26 +154,14 @@ def generate_portfolio_signals(
             })
             continue
 
-        drift = abs(new_w - old_w) / old_w if abs(old_w) > tolerance else float("inf")
-
-        if drift > drift_threshold:
-            results.append({
-                "Ticker": ticker,
-                "Signal": "REBALANCE",
-                "Old_Weight": old_w,
-                "New_Weight": new_w,
-                "Reason": f"Weight drifted by {drift:.2%}",
-                "Date": date_str,
-            })
-        else:
-            results.append({
-                "Ticker": ticker,
-                "Signal": "HOLD",
-                "Old_Weight": old_w,
-                "New_Weight": new_w,
-                "Reason": "No significant change",
-                "Date": date_str,
-            })
+        results.append({
+            "Ticker": ticker,
+            "Signal": "REBALANCE",
+            "Old_Weight": old_w,
+            "New_Weight": new_w,
+            "Reason": "Weight updated in latest optimization",
+            "Date": date_str,
+        })
 
     signals_df = pd.DataFrame(results)
     signals_df["Timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
