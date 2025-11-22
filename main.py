@@ -44,7 +44,17 @@ strategy = st.sidebar.selectbox(
     "Select Strategy", ["Momentum", "Mean Reversion", "Value", "Growth", "Quality"]
 )
 
-risk_level = st.sidebar.radio("Risk Level", ["Low", "Medium", "High"])
+# Map user-friendly Market Cap labels to the internal "risk_level" expected by the backend
+# Large Cap -> Low Risk (internal "Low")
+# Mid Cap -> Medium Risk (internal "Medium")
+# Small Cap -> High Risk (internal "High")
+market_cap_choice = st.sidebar.selectbox("Market Cap", ["Large Cap", "Mid Cap", "Small Cap"], index=1)
+risk_map = {
+    "Large Cap": "Low",
+    "Mid Cap": "Medium",
+    "Small Cap": "High"
+}
+risk_level = risk_map[market_cap_choice]
 capital = st.sidebar.number_input(
     "Capital ($)", min_value=1000, step=1000, value=10000
 )
@@ -505,7 +515,7 @@ if run_button:
         strategy_lookback = results.get("strategy_lookback_window")
         summary_items = [
             ("Strategy", results["strategy_name"]),
-            ("Risk Level", risk_level),
+            ("Market Cap", market_cap_choice),
             ("Start", strategy_start_label),
             ("As of", execution_label),
             ("Data Through", analysis_label),
@@ -673,7 +683,17 @@ if run_button:
             var_cols = st.columns(2)
             var_cols[0].metric("Parametric VaR (95%)", format_percentage(risk_report.get("parametric_VaR")))
             var_cols[1].metric("Historical VaR (95%)", format_percentage(risk_report.get("historical_VaR")))
-            st.caption("Risk metrics are derived from the blended allocation weights. Tail metrics shown in daily terms.")
+
+            stress_cols = st.columns(1)
+            stress_return = risk_report.get("stress_uniform_minus5_pct_portfolio_return")
+            if stress_return is not None and not pd.isna(stress_return):
+                stress_cols[0].metric("Uniform -5% Shock Return", format_percentage(stress_return))
+            else:
+                stress_cols[0].metric("Uniform -5% Shock Return", "N/A")
+
+            st.caption(
+                "Risk metrics are derived from the blended allocation weights. Tail metrics shown in daily terms; stress reflects a uniform -5% price shock."
+            )
 
         if missing:
             st.caption(
