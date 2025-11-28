@@ -154,6 +154,12 @@ def run_rebalance_cycle(
     backtest_start_dt = requested_backtest_start or strategy_start_dt
     backtest_end_dt = execution_dt
 
+    # Ensure backtest uses the same initial capital as the live state to prevent divergence
+    # if the user changes the sidebar input without resetting the state.
+    effective_capital = capital
+    if hasattr(state, "initial_capital") and state.initial_capital is not None:
+        effective_capital = float(state.initial_capital)
+
     previous_allocation = getattr(
         state, "last_allocation", pd.DataFrame(columns=["Ticker", "Weight"])
     )
@@ -594,7 +600,7 @@ def run_rebalance_cycle(
                         weight_history,
                         trade_log_df=trade_log_df if trade_log_df is not None and not trade_log_df.empty else None,
                         rebalance_freq=backtest_rebalance_freq,
-                        initial_capital=capital,
+                        initial_capital=effective_capital,
                         benchmark_df=benchmark_df,
                         start_date=backtest_start_dt,
                         end_date=backtest_end_dt,
@@ -625,7 +631,7 @@ def run_rebalance_cycle(
                         backtest_price_history,
                         weights_df,
                         rebalance_freq=backtest_rebalance_freq,
-                        initial_capital=capital,
+                        initial_capital=effective_capital,
                         benchmark_df=benchmark_df,
                         start_date=backtest_start_dt,
                         end_date=backtest_end_dt,
@@ -661,7 +667,7 @@ def run_rebalance_cycle(
                             candidate_allocation,
                             trade_log_df=trade_log_df if not trade_log_df.empty else None,
                             rebalance_freq=backtest_rebalance_freq,
-                            initial_capital=capital,
+                            initial_capital=effective_capital,
                             benchmark_df=benchmark_df,
                             start_date=backtest_start_dt,
                             end_date=backtest_end_dt,
