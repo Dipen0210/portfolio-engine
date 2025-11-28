@@ -29,8 +29,8 @@ from utils.trading_calendar import next_trading_day, previous_trading_day
 # ---------------------------------------------------------
 # Streamlit Page Config
 # ---------------------------------------------------------
-st.set_page_config(page_title="smallQ Portfolio Manager", layout="wide")
-st.title("📊 smallQ: Integrated Portfolio Manager")
+st.set_page_config(page_title=" Portfolio Manager", layout="wide")
+st.title("📊 Automated Portfolio Manager")
 
 # Inject custom CSS to make tabs expand to fill the width
 st.markdown("""
