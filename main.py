@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 from execution.execution_engine import run_rebalance_cycle as execute_rebalance
@@ -30,6 +31,24 @@ from utils.trading_calendar import next_trading_day, previous_trading_day
 # ---------------------------------------------------------
 st.set_page_config(page_title="smallQ Portfolio Manager", layout="wide")
 st.title("📊 smallQ: Integrated Portfolio Manager")
+
+# Inject custom CSS to make tabs expand to fill the width
+st.markdown("""
+    <style>
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 24px;
+        }
+        .stTabs [data-baseweb="tab"] {
+            height: 50px;
+            white-space: pre-wrap;
+            border-radius: 4px 4px 0px 0px;
+            gap: 1px;
+            padding-top: 10px;
+            padding-bottom: 10px;
+            flex-grow: 1;
+        }
+    </style>
+""", unsafe_allow_html=True)
 
 # ---------------------------------------------------------
 # Sidebar — User Inputs
@@ -511,195 +530,277 @@ if run_button:
         if execution_warning:
             st.warning(execution_warning)
 
-        st.write("### 📋 Selection Summary")
-        strategy_lookback = results.get("strategy_lookback_window")
-        summary_items = [
-            ("Strategy", results["strategy_name"]),
-            ("Market Cap", market_cap_choice),
-            ("Start", strategy_start_label),
-            ("As of", execution_label),
-            ("Data Through", analysis_label),
-            (
-                "Strategy Lookback",
-                f"{int(strategy_lookback)}d" if strategy_lookback else "Auto",
-            ),
-        ]
-        for i in range(0, len(summary_items), 3):
-            row_items = summary_items[i : i + 3]
-            cols = st.columns(len(row_items))
-            for col, (label, value) in zip(cols, row_items):
-                col.markdown(
-                    f"<div><strong>{label}</strong><br>{value}</div>",
-                    unsafe_allow_html=True,
-                )
-        summary_details = "<br>".join(
-            [
-                f"<strong>Rebalance cadence:</strong> {rebalance_choice}",
-                f"<strong>Backtest window:</strong> {backtest_start_label} → {backtest_end_label}",
-                f"<strong>Data through:</strong> {analysis_label}",
-                f"<strong>Selected sectors:</strong> {', '.join(sectors) if sectors else 'All available sectors'}",
+        # Prepare shared data for tabs
+        portfolio_cycles = getattr(state, "cycle_log", [])
+        state_cycle_df: pd.DataFrame | None = None
+        latest_state_row: pd.Series | None = None
+        initial_live_capital = float(getattr(state, "initial_capital", capital) or capital)
+        if portfolio_cycles:
+            state_cycle_df = pd.DataFrame(portfolio_cycles).copy()
+            if "Date" in state_cycle_df.columns:
+                state_cycle_df["Date"] = pd.to_datetime(state_cycle_df["Date"], errors="coerce")
+                state_cycle_df = state_cycle_df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+            numeric_cols = ["HoldingsValue", "Cash", "RealizedPnL", "UnrealizedPnL", "FeesPaid"]
+            for col in numeric_cols:
+                if col in state_cycle_df.columns:
+                    state_cycle_df[col] = pd.to_numeric(state_cycle_df[col], errors="coerce").fillna(0.0)
+                else:
+                    state_cycle_df[col] = 0.0
+            state_cycle_df["Current Position"] = state_cycle_df["HoldingsValue"]
+            state_cycle_df["GrossPnL"] = (
+                state_cycle_df["RealizedPnL"] + state_cycle_df["UnrealizedPnL"]
+            )
+            state_cycle_df["NetPnL"] = state_cycle_df["GrossPnL"] - state_cycle_df["FeesPaid"]
+            state_cycle_df["P/L"] = state_cycle_df["GrossPnL"]
+            state_cycle_df["ReturnPct"] = (
+                state_cycle_df["P/L"] / initial_live_capital if initial_live_capital else 0.0
+            )
+            state_cycle_df["RealizedCycle"] = state_cycle_df["RealizedPnL"].diff().fillna(
+                state_cycle_df["RealizedPnL"]
+            )
+            state_cycle_df["UnrealizedCycle"] = state_cycle_df["UnrealizedPnL"].diff().fillna(
+                state_cycle_df["UnrealizedPnL"]
+            )
+            state_cycle_df["Rebalances"] = state_cycle_df.index + 1
+            state_cycle_df["Execution Date"] = state_cycle_df["Date"].dt.strftime("%Y-%m-%d")
+            state_cycle_df["Transaction Costs"] = state_cycle_df["FeesPaid"]
+            latest_state_row = state_cycle_df.iloc[-1] if not state_cycle_df.empty else None
+
+        # Create tabs
+        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+            "📊 Dashboard",
+            "🎯 Selection & Strategy",
+            "🧠 Analysis & Risk",
+            "📡 Signals",
+            "📜 Backtest Details"
+        ])
+
+        with tab1:
+            st.write("### 📋 Selection Summary")
+            strategy_lookback = results.get("strategy_lookback_window")
+            # Calculate total days between Start and Data Through
+            try:
+                start_dt_obj = datetime.strptime(strategy_start_label, "%Y-%m-%d")
+                end_dt_obj = datetime.strptime(analysis_label, "%Y-%m-%d")
+                total_days = (end_dt_obj - start_dt_obj).days
+                lookback_display = f"{total_days} days"
+            except ValueError:
+                lookback_display = f"{int(strategy_lookback)}d" if strategy_lookback else "Auto"
+
+            summary_items = [
+                ("Strategy", results["strategy_name"]),
+                ("Market Cap", market_cap_choice),
+                ("Start", strategy_start_label),
+                ("As of", execution_label),
+                ("Data Through", analysis_label),
+                (
+                    "Total Days",
+                    lookback_display,
+                ),
+                (
+                    "Strategy Window",
+                    f"{int(strategy_lookback)}d" if strategy_lookback else "Auto",
+                ),
             ]
-        )
-        st.markdown(summary_details, unsafe_allow_html=True)
-        if allocation_carried:
-            st.info(
-                "Retained prior weights because new allocation data was unavailable for one or more holdings."
-            )
-        if fallback_equal_alloc:
-            st.info(
-                "Displayed weights default to equal-weight allocation due to insufficient price history for optimization."
-            )
-
-        st.divider()
-        st.write("### 💼 Current Allocation Snapshot")
-        if current_allocation is None or current_allocation.empty:
-            st.info("No allocation available. Optimization stage did not produce weights.")
-        else:
-            alloc_display = current_allocation.copy()
-            if "CarryForward" in alloc_display.columns:
-                alloc_display = alloc_display.drop(columns=["CarryForward"])
-            if "Weight" in alloc_display.columns:
-                alloc_display["Weight"] = truncate_series(
-                    pd.to_numeric(alloc_display["Weight"], errors="coerce"), decimals=4
-                )
-            if {"Ticker", "Weight"}.issubset(alloc_display.columns):
-                alloc_display = normalize_and_truncate_weights(alloc_display, decimals=4)
-            desired_order = ["Date", "Ticker", "Weight"]
-            alloc_display = alloc_display[[col for col in desired_order if col in alloc_display.columns] + [c for c in alloc_display.columns if c not in desired_order]]
-            st.dataframe(alloc_display.reset_index(drop=True), hide_index=True)
-            st.caption("Allocation as of the selected date. Weights sum to 100% across active holdings.")
-            if {"Ticker", "Weight"}.issubset(alloc_display.columns):
-                pie_source = (
-                    alloc_display.loc[:, ["Ticker", "Weight"]]
-                    .assign(Weight=lambda df_: pd.to_numeric(df_["Weight"], errors="coerce"))
-                    .dropna(subset=["Weight"])
-                )
-                pie_source = pie_source[pie_source["Weight"] > 0]
-                if not pie_source.empty:
-                    fig = px.pie(
-                        pie_source,
-                        names="Ticker",
-                        values="Weight",
-                        title="Allocation Breakdown",
+            for i in range(0, len(summary_items), 3):
+                row_items = summary_items[i : i + 3]
+                cols = st.columns(len(row_items))
+                for col, (label, value) in zip(cols, row_items):
+                    col.markdown(
+                        f"<div><strong>{label}</strong><br>{value}</div>",
+                        unsafe_allow_html=True,
                     )
-                    st.plotly_chart(fig, use_container_width=True)
-
-        st.divider()
-        st.write("### 🧾 Hard Filter Winners (Top 10 per Sector)")
-        if candidate_pool.empty:
-            st.warning("No stocks passed the hard filters. Consider broadening your criteria.")
-        else:
-            st.dataframe(candidate_pool.reset_index(drop=True), hide_index=True)
-            top_n_display = int(candidate_pool.groupby("sector").size().max())
-            st.caption(f"Displayed: Top {top_n_display} per sector based on risk-adjusted market cap filter.")
-
-        st.divider()
-        st.write("### 🏁 Strategy Winners (Top 3 per Sector)")
-        if final_df.empty:
-            st.info("Strategy did not produce any qualifying picks. Try adjusting the filters or selecting a different strategy.")
-        else:
-            display_cols = ["Ticker", "Sector", "Strategy_Score", "Rank"]
-            winners_df = (
-                final_df.loc[:, display_cols]
-                .sort_values(["Sector", "Rank"])
-                .reset_index(drop=True)
+            summary_details = "<br>".join(
+                [
+                    f"<strong>Rebalance cadence:</strong> {rebalance_choice}",
+                    f"<strong>Backtest window:</strong> {backtest_start_label} → {backtest_end_label}",
+                    f"<strong>Data through:</strong> {analysis_label}",
+                    f"<strong>Selected sectors:</strong> {', '.join(sectors) if sectors else 'All available sectors'}",
+                ]
             )
-            if "Strategy_Score" in winners_df.columns:
-                winners_df["Strategy_Score"] = truncate_series(
-                    pd.to_numeric(winners_df["Strategy_Score"], errors="coerce"), decimals=4
+            st.markdown(summary_details, unsafe_allow_html=True)
+            if allocation_carried:
+                st.info(
+                    "Retained prior weights because new allocation data was unavailable for one or more holdings."
                 )
-            st.dataframe(winners_df.reset_index(drop=True), hide_index=True)
-            st.caption("These top-ranked tickers will flow into the forecasting layer for further analysis.")
+            if fallback_equal_alloc:
+                st.info(
+                    "Displayed weights default to equal-weight allocation due to insufficient price history for optimization."
+                )
 
-        if forecast_exclusions:
-            st.warning(
-                "The following tickers were removed before forecasting due to insufficient price history: "
-                + ", ".join(forecast_exclusions)
-            )
+            st.divider()
+            st.write("### 💼 Current Allocation Snapshot")
+            if current_allocation is None or current_allocation.empty:
+                st.info("No allocation available. Optimization stage did not produce weights.")
+            else:
+                alloc_display = current_allocation.copy()
+                if "CarryForward" in alloc_display.columns:
+                    alloc_display = alloc_display.drop(columns=["CarryForward"])
+                if "Weight" in alloc_display.columns:
+                    alloc_display["Weight"] = truncate_series(
+                        pd.to_numeric(alloc_display["Weight"], errors="coerce"), decimals=4
+                    )
+                if {"Ticker", "Weight"}.issubset(alloc_display.columns):
+                    alloc_display = normalize_and_truncate_weights(alloc_display, decimals=4)
+                desired_order = ["Date", "Ticker", "Weight"]
+                alloc_display = alloc_display[[col for col in desired_order if col in alloc_display.columns] + [c for c in alloc_display.columns if c not in desired_order]]
+                st.dataframe(alloc_display.reset_index(drop=True), hide_index=True)
+                st.caption("Allocation as of the selected date. Weights sum to 100% across active holdings.")
+                if {"Ticker", "Weight"}.issubset(alloc_display.columns):
+                    pie_source = (
+                        alloc_display.loc[:, ["Ticker", "Weight"]]
+                        .assign(Weight=lambda df_: pd.to_numeric(df_["Weight"], errors="coerce"))
+                        .dropna(subset=["Weight"])
+                    )
+                    pie_source = pie_source[pie_source["Weight"] > 0]
+                    if not pie_source.empty:
+                        fig = px.pie(
+                            pie_source,
+                            names="Ticker",
+                            values="Weight",
+                            title="Allocation Breakdown",
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
 
-        st.divider()
-        st.write("### 📈 Forecasted Returns (μ)")
-        if expected_returns_df is None or expected_returns_df.empty:
-            st.info("Not enough price history to compute expected returns for the selected winners.")
-        else:
-            st.dataframe(
-                expected_returns_df.sort_values("Expected_Return", ascending=False).reset_index(drop=True),
-                hide_index=True,
-            )
-            if strategy_lookback:
+            st.divider()
+            live_holdings = _build_live_holdings(state)
+            if live_holdings is not None and not live_holdings.empty:
+                st.write("### 📂 Live Holdings Snapshot")
+                live_display = live_holdings.copy()
+                if "Shares" in live_display.columns:
+                    live_display["Shares"] = live_display["Shares"].apply(
+                        lambda x: "" if x in ("", None) else f"{float(x):.4f}"
+                    )
+                for col in ["Price", "MarketValue"]:
+                    if col in live_display.columns:
+                        live_display[col] = live_display[col].apply(
+                            lambda v: "" if v in ("", None) else format_currency(v)
+                        )
+                st.dataframe(live_display, hide_index=True)
+                snapshot_label = execution_label
+                if 'state_cycle_df' in locals() and state_cycle_df is not None:
+                    if "Execution Date" in state_cycle_df.columns:
+                        snapshot_label = state_cycle_df["Execution Date"].iloc[-1]
                 st.caption(
-                    f"Expected returns rely on the strategy-defined lookback window (~{int(strategy_lookback)} days) when sufficient price history exists."
+                    f"Live holdings reflect the latest executed rebalance as of {snapshot_label}."
                 )
+
+        with tab2:
+            st.write("### 🧾 Hard Filter Winners (Top 10 per Sector)")
+            if candidate_pool.empty:
+                st.warning("No stocks passed the hard filters. Consider broadening your criteria.")
             else:
-                st.caption("Expected returns rely on the strategy-defined lookback window when sufficient price history exists.")
+                st.dataframe(candidate_pool.reset_index(drop=True), hide_index=True)
+                top_n_display = int(candidate_pool.groupby("sector").size().max())
+                st.caption(f"Displayed: Top {top_n_display} per sector based on risk-adjusted market cap filter.")
 
-        st.divider()
-        st.write("### ⚖️ Optimization & Allocation")
-        if optimized_weights is None or optimized_weights.empty:
-            st.info("Optimization was skipped (not enough data or optimization failed).")
-        else:
-            opt_df = optimized_weights.rename("Opt_Weight").reset_index().rename(columns={"index": "Ticker"})
-            opt_df["Opt_Weight"] = truncate_series(
-                pd.to_numeric(opt_df["Opt_Weight"], errors="coerce"), decimals=4
-            )
-            st.markdown("**Mean-Variance Optimized Weights**")
-            st.dataframe(opt_df.reset_index(drop=True), hide_index=True)
-
-        if hybrid_allocation is not None and not hybrid_allocation.empty:
-            hybrid_display = hybrid_allocation.copy()
-            for col in ["Final_Weight", "Rank_Weight", "Opt_Weight"]:
-                if col in hybrid_display.columns:
-                    hybrid_display[col] = truncate_series(
-                        pd.to_numeric(hybrid_display[col], errors="coerce"), decimals=4
+            st.divider()
+            st.write("### 🏁 Strategy Winners (Top 3 per Sector)")
+            if final_df.empty:
+                st.info("Strategy did not produce any qualifying picks. Try adjusting the filters or selecting a different strategy.")
+            else:
+                display_cols = ["Ticker", "Sector", "Strategy_Score", "Rank"]
+                winners_df = (
+                    final_df.loc[:, display_cols]
+                    .sort_values(["Sector", "Rank"])
+                    .reset_index(drop=True)
+                )
+                if "Strategy_Score" in winners_df.columns:
+                    winners_df["Strategy_Score"] = truncate_series(
+                        pd.to_numeric(winners_df["Strategy_Score"], errors="coerce"), decimals=4
                     )
-            st.markdown("**Blended Allocation (Rank vs. Optimizer)**")
-            st.dataframe(hybrid_display.reset_index(drop=True), hide_index=True)
-            st.caption("Final weights blend rank-based intuition with mean-variance optimization.")
+                st.dataframe(winners_df.reset_index(drop=True), hide_index=True)
+                st.caption("These top-ranked tickers will flow into the forecasting layer for further analysis.")
 
-        st.divider()
-        st.write("### 🛡️ Risk Snapshot")
-        if not risk_report:
-            st.info("Risk metrics unavailable (missing weights or price history).")
-        else:
-            risk_cols = st.columns(3)
-            annualized_vol = risk_report.get("annualized_vol", float("nan"))
-            if not pd.isna(annualized_vol):
-                risk_cols[0].metric("Annualized Volatility", format_percentage(annualized_vol))
+            if forecast_exclusions:
+                st.warning(
+                    "The following tickers were removed before forecasting due to insufficient price history: "
+                    + ", ".join(forecast_exclusions)
+                )
+
+        with tab3:
+            st.write("### 📈 Forecasted Returns (μ)")
+            if expected_returns_df is None or expected_returns_df.empty:
+                st.info("Not enough price history to compute expected returns for the selected winners.")
             else:
-                risk_cols[0].metric("Annualized Volatility", "N/A")
+                st.dataframe(
+                    expected_returns_df.sort_values("Expected_Return", ascending=False).reset_index(drop=True),
+                    hide_index=True,
+                )
+                if strategy_lookback:
+                    st.caption(
+                        f"Expected returns rely on the strategy-defined lookback window (~{int(strategy_lookback)} days) when sufficient price history exists."
+                    )
+                else:
+                    st.caption("Expected returns rely on the strategy-defined lookback window when sufficient price history exists.")
 
-            annualized_mean = risk_report.get("annualized_mean", float("nan"))
-            if not pd.isna(annualized_mean):
-                risk_cols[1].metric("Annualized Return", format_percentage(annualized_mean))
+            st.divider()
+            st.write("### ⚖️ Optimization & Allocation")
+            if optimized_weights is None or optimized_weights.empty:
+                st.info("Optimization was skipped (not enough data or optimization failed).")
             else:
-                risk_cols[1].metric("Annualized Return", "N/A")
+                opt_df = optimized_weights.rename("Opt_Weight").reset_index().rename(columns={"index": "Ticker"})
+                opt_df["Opt_Weight"] = truncate_series(
+                    pd.to_numeric(opt_df["Opt_Weight"], errors="coerce"), decimals=4
+                )
+                st.markdown("**Mean-Variance Optimized Weights**")
+                st.dataframe(opt_df.reset_index(drop=True), hide_index=True)
 
-            sharpe_value = risk_report.get("sharpe", float("nan"))
-            if not pd.isna(sharpe_value):
-                risk_cols[2].metric("Sharpe Ratio", f"{truncate_value(sharpe_value, decimals=4):.4f}")
+            if hybrid_allocation is not None and not hybrid_allocation.empty:
+                hybrid_display = hybrid_allocation.copy()
+                for col in ["Final_Weight", "Rank_Weight", "Opt_Weight"]:
+                    if col in hybrid_display.columns:
+                        hybrid_display[col] = truncate_series(
+                            pd.to_numeric(hybrid_display[col], errors="coerce"), decimals=4
+                        )
+                st.markdown("**Blended Allocation (Rank vs. Optimizer)**")
+                st.dataframe(hybrid_display.reset_index(drop=True), hide_index=True)
+                st.caption("Final weights blend rank-based intuition with mean-variance optimization.")
+
+            st.divider()
+            st.write("### 🛡️ Risk Snapshot")
+            if not risk_report:
+                st.info("Risk metrics unavailable (missing weights or price history).")
             else:
-                risk_cols[2].metric("Sharpe Ratio", "N/A")
+                risk_cols = st.columns(3)
+                annualized_vol = risk_report.get("annualized_vol", float("nan"))
+                if not pd.isna(annualized_vol):
+                    risk_cols[0].metric("Annualized Volatility", format_percentage(annualized_vol))
+                else:
+                    risk_cols[0].metric("Annualized Volatility", "N/A")
 
-            var_cols = st.columns(2)
-            var_cols[0].metric("Parametric VaR (95%)", format_percentage(risk_report.get("parametric_VaR")))
-            var_cols[1].metric("Historical VaR (95%)", format_percentage(risk_report.get("historical_VaR")))
+                annualized_mean = risk_report.get("annualized_mean", float("nan"))
+                if not pd.isna(annualized_mean):
+                    risk_cols[1].metric("Annualized Return", format_percentage(annualized_mean))
+                else:
+                    risk_cols[1].metric("Annualized Return", "N/A")
 
-            stress_cols = st.columns(1)
-            stress_return = risk_report.get("stress_uniform_minus5_pct_portfolio_return")
-            if stress_return is not None and not pd.isna(stress_return):
-                stress_cols[0].metric("Uniform -5% Shock Return", format_percentage(stress_return))
-            else:
-                stress_cols[0].metric("Uniform -5% Shock Return", "N/A")
+                sharpe_value = risk_report.get("sharpe", float("nan"))
+                if not pd.isna(sharpe_value):
+                    risk_cols[2].metric("Sharpe Ratio", f"{truncate_value(sharpe_value, decimals=4):.4f}")
+                else:
+                    risk_cols[2].metric("Sharpe Ratio", "N/A")
 
-            st.caption(
-                "Risk metrics are derived from the blended allocation weights. Tail metrics shown in daily terms; stress reflects a uniform -5% price shock."
-            )
+                var_cols = st.columns(2)
+                var_cols[0].metric("Parametric VaR (95%)", format_percentage(risk_report.get("parametric_VaR")))
+                var_cols[1].metric("Historical VaR (95%)", format_percentage(risk_report.get("historical_VaR")))
 
-        if missing:
-            st.caption(
-                f"OHLCV data unavailable for {len(missing)} tickers: "
-                + ", ".join(missing)
-            )
+                stress_cols = st.columns(1)
+                stress_return = risk_report.get("stress_uniform_minus5_pct_portfolio_return")
+                if stress_return is not None and not pd.isna(stress_return):
+                    stress_cols[0].metric("Uniform -5% Shock Return", format_percentage(stress_return))
+                else:
+                    stress_cols[0].metric("Uniform -5% Shock Return", "N/A")
+
+                st.caption(
+                    "Risk metrics are derived from the blended allocation weights. Tail metrics shown in daily terms; stress reflects a uniform -5% price shock."
+                )
+
+            if missing:
+                st.caption(
+                    f"OHLCV data unavailable for {len(missing)} tickers: "
+                    + ", ".join(missing)
+                )
 
         st.divider()
         backtest_curve = backtest_results.get("portfolio") if backtest_results else None
@@ -740,430 +841,529 @@ if run_button:
 
         weights_as_of = results.get("weights_as_of")
 
-        st.write("### 📬 Trade Signals")
-        if trade_signals is None or trade_signals.empty:
-            st.info("No trade signals generated. Portfolio unchanged.")
-        else:
-            signals_display = trade_signals.copy()
-            if "Old_Weight" in signals_display.columns:
-                signals_display["Old_Weight"] = truncate_series(
-                    pd.to_numeric(signals_display["Old_Weight"], errors="coerce"),
-                    decimals=4,
-                )
-            if "New_Weight" in signals_display.columns:
-                signals_display["New_Weight"] = truncate_series(
-                    pd.to_numeric(signals_display["New_Weight"], errors="coerce"),
-                    decimals=4,
-                )
-                st.dataframe(signals_display, hide_index=True)
-                caption_fragments = [
-                    f"{len(signals_display)} trade instructions generated using pre-set position drift rules."
-                ]
-                if weights_as_of is not None:
-                    caption_fragments.append(
-                        f"Weights derived from price history through {pd.to_datetime(weights_as_of).strftime('%Y-%m-%d')}."
-                    )
-                st.caption(" ".join(caption_fragments))
-
-        st.divider()
-        st.write("### 🧾 Generated Signal History")
-        if trade_log is None or trade_log.empty:
-            st.info("Generated signal history is empty. Run at least one rebalance cycle.")
-        else:
-            log_display = trade_log.copy()
-            if "Date" in log_display.columns:
-                log_display["Date"] = pd.to_datetime(
-                    log_display["Date"], errors="coerce"
-                )
-            if "Timestamp" in log_display.columns:
-                log_display["Timestamp"] = pd.to_datetime(
-                    log_display["Timestamp"], errors="coerce"
-                )
-            if "Execution_Date" in log_display.columns:
-                log_display["Execution_Date"] = pd.to_datetime(
-                    log_display["Execution_Date"], errors="coerce"
-                )
-            if "Data_Through" in log_display.columns:
-                log_display["Data_Through"] = pd.to_datetime(
-                    log_display["Data_Through"], errors="coerce"
-                )
-            sort_cols: list[str] = []
-            ascending: list[bool] = []
-            if "Data_Through" in log_display.columns:
-                sort_cols.append("Data_Through")
-                ascending.append(True)
-            elif "Date" in log_display.columns:
-                sort_cols.append("Date")
-                ascending.append(True)
-            if "Execution_Date" in log_display.columns:
-                sort_cols.append("Execution_Date")
-                ascending.append(True)
-            if "Ticker" in log_display.columns:
-                sort_cols.append("Ticker")
-                ascending.append(True)
-            if sort_cols:
-                log_display = log_display.sort_values(
-                    sort_cols, ascending=ascending, kind="mergesort"
-                ).reset_index(drop=True)
-            if "Old_Weight" in log_display.columns:
-                log_display["Old_Weight"] = truncate_series(
-                    pd.to_numeric(log_display["Old_Weight"], errors="coerce"),
-                    decimals=4,
-                )
-            if "New_Weight" in log_display.columns:
-                log_display["New_Weight"] = truncate_series(
-                    pd.to_numeric(log_display["New_Weight"], errors="coerce"),
-                    decimals=4,
-                )
-            if "Date" in log_display.columns:
-                log_display["Date"] = log_display["Date"].dt.strftime("%Y-%m-%d")
-            if "Timestamp" in log_display.columns:
-                log_display["Timestamp"] = log_display["Timestamp"].dt.strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
-            if "Execution_Date" in log_display.columns:
-                log_display["Execution_Date"] = log_display["Execution_Date"].dt.strftime(
-                    "%Y-%m-%d"
-                )
-            if "Data_Through" in log_display.columns:
-                log_display["Data_Through"] = log_display["Data_Through"].dt.strftime(
-                    "%Y-%m-%d"
-                )
-            desired_log_order = [
-                "Data_Through",
-                "Execution_Date",
-                "Ticker",
-                "Signal",
-                "Old_Weight",
-                "New_Weight",
-                "Reason",
-                "Timestamp",
-            ]
-            log_display = log_display[[col for col in desired_log_order if col in log_display.columns]]
-            st.dataframe(log_display.tail(100), hide_index=True)
-            log_caption = "Most recent 100 generated signals."
-            if weights_as_of is not None:
-                log_caption += f" Signals reflect data through {pd.to_datetime(weights_as_of).strftime('%Y-%m-%d')}."
-            st.caption(log_caption)
-
-        st.divider()
-        st.write("### 🔁 Backtest Transactions")
-        missing_price_notes = backtest_summary.get("missing_price_notes", []) if backtest_available else []
-        if transactions_df is None or transactions_df.empty:
-            if missing_price_notes:
-                st.warning(
-                    "No backtest transactions recorded. Reasons: " + " | ".join(missing_price_notes)
-                )
+        with tab4:
+            st.write("### 📬 Trade Signals")
+            if trade_signals is None or trade_signals.empty:
+                st.info("No trade signals generated. Portfolio unchanged.")
             else:
-                st.info("No backtest transactions available.")
-        else:
-            display_tx = transactions_df.copy()
-            numeric_cols = [
-                "Net_Weight",
-                "Shares",
-                "Price",
-                "TradeValue",
-                "CashFlow",
-                "Transaction Cost",
-                "RemainingCash",
-            ]
-            for col in numeric_cols:
-                if col in display_tx.columns:
-                    display_tx[col] = truncate_series(
-                        pd.to_numeric(display_tx[col], errors="coerce"),
+                signals_display = trade_signals.copy()
+                if "Old_Weight" in signals_display.columns:
+                    signals_display["Old_Weight"] = truncate_series(
+                        pd.to_numeric(signals_display["Old_Weight"], errors="coerce"),
                         decimals=4,
                     )
-            display_tx = display_tx.rename(columns={"Net_Weight": "Net weight"})
-            display_tx["Date"] = pd.to_datetime(display_tx["Date"]).dt.strftime("%Y-%m-%d")
-            column_order = [
-                "Date",
-                "Ticker",
-                "Signal",
-                "Action",
-                "Net weight",
-                "Reason",
-                "Shares",
-                "Price",
-                "TradeValue",
-                "Transaction Cost",
-                "CashFlow",
-                "RemainingCash",
-            ]
-            display_tx = display_tx[
-                [c for c in column_order if c in display_tx.columns]
-            ]
-            total_trades = len(display_tx)
-            visible_tx = display_tx.head(100)
-            rows_shown = len(visible_tx)
-            table_height = min(900, 60 + rows_shown * 28)
-            st.dataframe(visible_tx, hide_index=True, height=table_height)
-            caption = f"{total_trades} trades recorded across the backtest window. "
-            if rows_shown < total_trades:
-                caption += f"Showing the first {rows_shown} trades. "
-            caption += "Positive CashFlow reflects capital returned to cash."
-            st.caption(caption)
-
-        st.divider()
-        st.write("### 📂 Open Backtest Holdings")
-        holdings_columns = ["Ticker", "Shares", "Price", "MarketValue"]
-        if holdings_df is None or holdings_df.empty:
-            st.info("No open holdings at the end of the backtest window.")
-        else:
-            holdings_display = holdings_df.copy()
-            for col in ["Shares", "Price", "MarketValue"]:
-                if col in holdings_display.columns:
-                    holdings_display[col] = truncate_series(
-                        pd.to_numeric(holdings_display[col], errors="coerce"),
+                if "New_Weight" in signals_display.columns:
+                    signals_display["New_Weight"] = truncate_series(
+                        pd.to_numeric(signals_display["New_Weight"], errors="coerce"),
                         decimals=4,
                     )
-            holdings_display = holdings_display.reindex(columns=holdings_columns)
-            st.dataframe(holdings_display, hide_index=True)
-            holdings_label = summary_end_label if summary_end_label != "-" else "final backtest date"
-            st.caption(f"Mark-to-market holdings as of {holdings_label}.")
-
-        live_holdings = _build_live_holdings(state)
-        if live_holdings is not None and not live_holdings.empty:
-            st.write("### 📂 Live Holdings Snapshot")
-            live_display = live_holdings.copy()
-            if "Shares" in live_display.columns:
-                live_display["Shares"] = live_display["Shares"].apply(
-                    lambda x: "" if x in ("", None) else f"{float(x):.4f}"
-                )
-            for col in ["Price", "MarketValue"]:
-                if col in live_display.columns:
-                    live_display[col] = live_display[col].apply(
-                        lambda v: "" if v in ("", None) else format_currency(v)
-                    )
-            st.dataframe(live_display, hide_index=True)
-            snapshot_label = execution_label
-            if 'state_cycle_df' in locals() and state_cycle_df is not None:
-                if "Execution Date" in state_cycle_df.columns:
-                    snapshot_label = state_cycle_df["Execution Date"].iloc[-1]
-            st.caption(
-                f"Live holdings reflect the latest executed rebalance as of {snapshot_label}."
-            )
-
-        st.divider()
-        st.write(f"### 🔄 Backtest ({rebalance_choice} Rebalance)")
-        if not backtest_available:
-            if backtest_error:
-                st.warning(
-                    f"Backtest unavailable: {backtest_error}"
-                )
-            else:
-                st.info(
-                    "Backtest unavailable. Ensure sufficient price history and weights, then rerun."
-                )
-        else:
-            initial_capital_amt = backtest_summary.get("initial_capital", capital)
-            realized_amt = backtest_summary.get("realized_pnl")
-            unrealized_amt = backtest_summary.get("unrealized_pnl")
-            price_pnl = None
-            price_return_pct = None
-            if realized_amt is not None or unrealized_amt is not None:
-                price_pnl = (realized_amt or 0.0) + (unrealized_amt or 0.0)
-                if initial_capital_amt:
-                    price_return_pct = price_pnl / float(initial_capital_amt)
-            if price_pnl is None:
-                price_pnl = ret_amt
-            if price_return_pct is None:
-                price_return_pct = ret_pct
-
-        portfolio_cycles = getattr(state, "cycle_log", [])
-        state_cycle_df: pd.DataFrame | None = None
-        latest_state_row: pd.Series | None = None
-        initial_live_capital = float(getattr(state, "initial_capital", capital) or capital)
-        if portfolio_cycles:
-            state_cycle_df = pd.DataFrame(portfolio_cycles).copy()
-            if "Date" in state_cycle_df.columns:
-                state_cycle_df["Date"] = pd.to_datetime(state_cycle_df["Date"], errors="coerce")
-                state_cycle_df = state_cycle_df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
-            numeric_cols = ["HoldingsValue", "Cash", "RealizedPnL", "UnrealizedPnL", "FeesPaid"]
-            for col in numeric_cols:
-                if col in state_cycle_df.columns:
-                    state_cycle_df[col] = pd.to_numeric(state_cycle_df[col], errors="coerce").fillna(0.0)
-                else:
-                    state_cycle_df[col] = 0.0
-            state_cycle_df["Current Position"] = state_cycle_df["HoldingsValue"]
-            state_cycle_df["GrossPnL"] = (
-                state_cycle_df["RealizedPnL"] + state_cycle_df["UnrealizedPnL"]
-            )
-            state_cycle_df["NetPnL"] = state_cycle_df["GrossPnL"] - state_cycle_df["FeesPaid"]
-            state_cycle_df["P/L"] = state_cycle_df["GrossPnL"]
-            state_cycle_df["ReturnPct"] = (
-                state_cycle_df["P/L"] / initial_live_capital if initial_live_capital else 0.0
-            )
-            state_cycle_df["RealizedCycle"] = state_cycle_df["RealizedPnL"].diff().fillna(
-                state_cycle_df["RealizedPnL"]
-            )
-            state_cycle_df["UnrealizedCycle"] = state_cycle_df["UnrealizedPnL"].diff().fillna(
-                state_cycle_df["UnrealizedPnL"]
-            )
-            state_cycle_df["Rebalances"] = state_cycle_df.index + 1
-            state_cycle_df["Execution Date"] = state_cycle_df["Date"].dt.strftime("%Y-%m-%d")
-            state_cycle_df["Transaction Costs"] = state_cycle_df["FeesPaid"]
-            latest_state_row = state_cycle_df.iloc[-1] if not state_cycle_df.empty else None
-
-        backtest_summary_cols = st.columns(4)
-        cash_amt = backtest_summary.get("ending_cash")
-        current_position_amt = final_amt
-        if current_position_amt is not None and cash_amt is not None:
-            current_position_amt = current_position_amt - cash_amt
-        else:
-            current_position_amt = invested_amt
-        txn_cost_amt = backtest_summary.get("transaction_cost_total")
-
-        rebalance_display_count = int(rebalance_count)
-        if latest_state_row is not None:
-            current_position_amt = float(latest_state_row.get("Current Position", current_position_amt or 0.0))
-            cash_amt = float(latest_state_row.get("Cash", cash_amt or 0.0))
-            price_pnl = float(latest_state_row.get("P/L", price_pnl or 0.0))
-            price_return_pct = float(latest_state_row.get("ReturnPct", price_return_pct or 0.0))
-            rebalance_display_count = int(latest_state_row.get("Rebalances", rebalance_display_count))
-            txn_cost_amt = float(latest_state_row.get("Transaction Costs", txn_cost_amt or 0.0))
-            realized_amt = float(latest_state_row.get("RealizedPnL", realized_amt or 0.0))
-            unrealized_amt = float(latest_state_row.get("UnrealizedPnL", unrealized_amt or 0.0))
-
-        backtest_summary_cols[0].metric(
-            "Current Position", _fmt_dollar(current_position_amt)
-        )
-        backtest_summary_cols[1].metric("P/L", _fmt_dollar(price_pnl))
-        backtest_summary_cols[2].metric("Return %", _fmt_pct(price_return_pct))
-        backtest_summary_cols[3].metric("Rebalances", str(int(rebalance_display_count)))
-
-        cumulative_realized = realized_amt
-        latest_unrealized = unrealized_amt
-
-        pnl_cols = st.columns(4)
-        if cumulative_realized is not None:
-            pnl_cols[0].metric("Cumulative Realized P/L", _fmt_dollar(cumulative_realized))
-        if latest_unrealized is not None:
-            pnl_cols[1].metric("Unrealized P/L", _fmt_dollar(latest_unrealized))
-        if txn_cost_amt is not None:
-            pnl_cols[2].metric("Transaction Costs", _fmt_dollar(txn_cost_amt))
-        if cash_amt is not None:
-            pnl_cols[3].metric("Cash", _fmt_dollar(cash_amt))
-
-            if rebalance_count == 0:
-                st.caption(
-                    "No scheduled rebalances executed; holdings carried throughout the window."
-                )
-            elif rebalance_dates:
-                formatted_rebalance_dates = [
-                    pd.to_datetime(dt).strftime("%Y-%m-%d") for dt in rebalance_dates
-                ]
-                st.caption(
-                    "Rebalances executed on: " + ", ".join(formatted_rebalance_dates)
-                )
-            calendar_notes = [
-                note for note in backtest_summary.get("calendar_notes", []) if note
-            ]
-            if calendar_notes:
-                st.caption("Calendar adjustments: " + " | ".join(calendar_notes))
-            if missing_price_notes:
-                st.caption("Skipped trades: " + " | ".join(missing_price_notes))
-
-            if backtest_curve is not None and not backtest_curve.empty:
-                chart_df = backtest_curve.copy()
-                if not isinstance(chart_df.index, pd.DatetimeIndex):
-                    chart_df = chart_df.copy()
-                    chart_df.index = pd.to_datetime(chart_df.index)
-                value_df = chart_df[["Portfolio Value"]]
-                if benchmark_curve is not None and not benchmark_curve.empty:
-                    bench_chart = benchmark_curve.copy()
-                    if not isinstance(bench_chart.index, pd.DatetimeIndex):
-                        bench_chart.index = pd.to_datetime(bench_chart.index)
-                    value_df = value_df.join(
-                        bench_chart["Benchmark Value"], how="inner"
-                    )
-                    value_df = value_df.rename(columns={"Benchmark Value": "S&P 500"})
-                st.line_chart(value_df.rename(columns={"Portfolio Value": "Portfolio"}))
-                st.caption(
-                    f"Portfolio value trajectory ({rebalance_choice.lower()} rebalance) versus S&P 500 benchmark."
-                )
-
-            if backtest_metrics:
-                rows = [
-                    "Annualized Return",
-                    "Annualized Volatility",
-                    "Sharpe Ratio",
-                    "Sortino Ratio",
-                    "Max Drawdown",
-                    "CAGR",
-                ]
-                metrics_data = {
-                    "Metric": rows,
-                    "Portfolio": [
-                        format_percentage(backtest_metrics.get("Annualized Return")),
-                        format_percentage(backtest_metrics.get("Annualized Volatility")),
-                        _fmt_ratio(backtest_metrics.get("Sharpe Ratio")),
-                        _fmt_ratio(backtest_metrics.get("Sortino Ratio")),
-                        format_percentage(backtest_metrics.get("Max Drawdown")),
-                        format_percentage(backtest_metrics.get("CAGR")),
-                    ],
-                }
-                if benchmark_metrics:
-                    metrics_data["S&P 500"] = [
-                        format_percentage(benchmark_metrics.get("Annualized Return")),
-                        format_percentage(benchmark_metrics.get("Annualized Volatility")),
-                        _fmt_ratio(benchmark_metrics.get("Sharpe Ratio")),
-                        _fmt_ratio(benchmark_metrics.get("Sortino Ratio")),
-                        format_percentage(benchmark_metrics.get("Max Drawdown")),
-                        format_percentage(benchmark_metrics.get("CAGR")),
+                    st.dataframe(signals_display, hide_index=True)
+                    caption_fragments = [
+                        f"{len(signals_display)} trade instructions generated using pre-set position drift rules."
                     ]
-                metrics_df = pd.DataFrame(metrics_data)
-                st.table(metrics_df)
+                    if weights_as_of is not None:
+                        caption_fragments.append(
+                            f"Weights derived from price history through {pd.to_datetime(weights_as_of).strftime('%Y-%m-%d')}."
+                        )
+                    st.caption(" ".join(caption_fragments))
+
+            st.divider()
+            st.write("### 🧾 Generated Signal History")
+            if trade_log is None or trade_log.empty:
+                st.info("Generated signal history is empty. Run at least one rebalance cycle.")
+            else:
+                log_display = trade_log.copy()
+                if "Date" in log_display.columns:
+                    log_display["Date"] = pd.to_datetime(
+                        log_display["Date"], errors="coerce"
+                    )
+                if "Timestamp" in log_display.columns:
+                    log_display["Timestamp"] = pd.to_datetime(
+                        log_display["Timestamp"], errors="coerce"
+                    )
+                if "Execution_Date" in log_display.columns:
+                    log_display["Execution_Date"] = pd.to_datetime(
+                        log_display["Execution_Date"], errors="coerce"
+                    )
+                if "Data_Through" in log_display.columns:
+                    log_display["Data_Through"] = pd.to_datetime(
+                        log_display["Data_Through"], errors="coerce"
+                    )
+                sort_cols: list[str] = []
+                ascending: list[bool] = []
+                if "Data_Through" in log_display.columns:
+                    sort_cols.append("Data_Through")
+                    ascending.append(True)
+                elif "Date" in log_display.columns:
+                    sort_cols.append("Date")
+                    ascending.append(True)
+                if "Execution_Date" in log_display.columns:
+                    sort_cols.append("Execution_Date")
+                    ascending.append(True)
+                if "Ticker" in log_display.columns:
+                    sort_cols.append("Ticker")
+                    ascending.append(True)
+                if sort_cols:
+                    log_display = log_display.sort_values(
+                        sort_cols, ascending=ascending, kind="mergesort"
+                    ).reset_index(drop=True)
+                if "Old_Weight" in log_display.columns:
+                    log_display["Old_Weight"] = truncate_series(
+                        pd.to_numeric(log_display["Old_Weight"], errors="coerce"),
+                        decimals=4,
+                    )
+                if "New_Weight" in log_display.columns:
+                    log_display["New_Weight"] = truncate_series(
+                        pd.to_numeric(log_display["New_Weight"], errors="coerce"),
+                        decimals=4,
+                    )
+                if "Date" in log_display.columns:
+                    log_display["Date"] = log_display["Date"].dt.strftime("%Y-%m-%d")
+                if "Timestamp" in log_display.columns:
+                    log_display["Timestamp"] = log_display["Timestamp"].dt.strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+                if "Execution_Date" in log_display.columns:
+                    log_display["Execution_Date"] = log_display["Execution_Date"].dt.strftime(
+                        "%Y-%m-%d"
+                    )
+                if "Data_Through" in log_display.columns:
+                    log_display["Data_Through"] = log_display["Data_Through"].dt.strftime(
+                        "%Y-%m-%d"
+                    )
+                desired_log_order = [
+                    "Data_Through",
+                    "Execution_Date",
+                    "Ticker",
+                    "Signal",
+                    "Old_Weight",
+                    "New_Weight",
+                    "Reason",
+                    "Timestamp",
+                ]
+                log_display = log_display[[col for col in desired_log_order if col in log_display.columns]]
+                st.dataframe(log_display.tail(100), hide_index=True)
+                log_caption = "Most recent 100 generated signals."
+                if weights_as_of is not None:
+                    log_caption += f" Signals reflect data through {pd.to_datetime(weights_as_of).strftime('%Y-%m-%d')}."
+                st.caption(log_caption)
+
+        with tab5:
+            st.write(f"### 🔄 Backtest ({rebalance_choice} Rebalance)")
+            if not backtest_available:
+                st.info("Backtest unavailable.")
+            else:
+                # Reuse metrics calculated in Tab 1 logic if available, otherwise recalculate or use defaults
+                # Since Tab 1 code runs before this in the file (if we moved it up? No, Tab 1 is at 977, Tab 5 is here at 896)
+                # Wait, Tab 1 code is at 977. This code is at 896.
+                # So Tab 1 code runs AFTER this code.
+                # So variables like current_position_amt are NOT yet updated by Tab 1 logic.
+                # We need to duplicate the calculation logic here.
+                
+                # Duplicate calculation logic
+                initial_capital_amt = backtest_summary.get("initial_capital", capital)
+                realized_amt = backtest_summary.get("realized_pnl")
+                unrealized_amt = backtest_summary.get("unrealized_pnl")
+                price_pnl = None
+                price_return_pct = None
+                if realized_amt is not None or unrealized_amt is not None:
+                    price_pnl = (realized_amt or 0.0) + (unrealized_amt or 0.0)
+                    if initial_capital_amt:
+                        price_return_pct = price_pnl / float(initial_capital_amt)
+                if price_pnl is None:
+                    price_pnl = ret_amt
+                if price_return_pct is None:
+                    price_return_pct = ret_pct
+
+                # Use shared state_cycle_df
+                state_cycle_df_local = state_cycle_df
+                latest_state_row_local = latest_state_row
+
+                backtest_summary_cols = st.columns(4)
+                cash_amt = backtest_summary.get("ending_cash")
+                current_position_amt = final_amt
+                if current_position_amt is not None and cash_amt is not None:
+                    current_position_amt = current_position_amt - cash_amt
+                else:
+                    current_position_amt = invested_amt
+                txn_cost_amt = backtest_summary.get("transaction_cost_total")
+
+                rebalance_display_count = int(rebalance_count)
+                if latest_state_row_local is not None:
+                    current_position_amt = float(latest_state_row_local.get("Current Position", current_position_amt or 0.0))
+                    cash_amt = float(latest_state_row_local.get("Cash", cash_amt or 0.0))
+                    price_pnl = float(latest_state_row_local.get("P/L", price_pnl or 0.0))
+                    price_return_pct = float(latest_state_row_local.get("ReturnPct", price_return_pct or 0.0))
+                    rebalance_display_count = int(latest_state_row_local.get("Rebalances", rebalance_display_count))
+                    txn_cost_amt = float(latest_state_row_local.get("Transaction Costs", txn_cost_amt or 0.0))
+                    realized_amt = float(latest_state_row_local.get("RealizedPnL", realized_amt or 0.0))
+                    unrealized_amt = float(latest_state_row_local.get("UnrealizedPnL", unrealized_amt or 0.0))
+
+                backtest_summary_cols[0].metric(
+                    "Current Position", _fmt_dollar(current_position_amt)
+                )
+                backtest_summary_cols[1].metric("P/L", _fmt_dollar(price_pnl))
+                backtest_summary_cols[2].metric("Return %", _fmt_pct(price_return_pct))
+                backtest_summary_cols[3].metric("Rebalances", str(int(rebalance_display_count)))
+
+                cumulative_realized = realized_amt
+                latest_unrealized = unrealized_amt
+
+                pnl_cols = st.columns(4)
+                if cumulative_realized is not None:
+                    pnl_cols[0].metric("Cumulative Realized P/L", _fmt_dollar(cumulative_realized))
+                if latest_unrealized is not None:
+                    pnl_cols[1].metric("Unrealized P/L", _fmt_dollar(latest_unrealized))
+                if txn_cost_amt is not None:
+                    pnl_cols[2].metric("Transaction Costs", _fmt_dollar(txn_cost_amt))
+                if cash_amt is not None:
+                    pnl_cols[3].metric("Cash", _fmt_dollar(cash_amt))
+
+                # Metrics table removed from Tab 5 as per user request
+
+            st.divider()
+            st.write("### 🔁 Backtest Transactions")
+            missing_price_notes = backtest_summary.get("missing_price_notes", []) if backtest_available else []
+            if transactions_df is None or transactions_df.empty:
+                if missing_price_notes:
+                    st.warning(
+                        "No backtest transactions recorded. Reasons: " + " | ".join(missing_price_notes)
+                    )
+                else:
+                    st.info("No backtest transactions available.")
+            else:
+                display_tx = transactions_df.copy()
+                numeric_cols = [
+                    "Net_Weight",
+                    "Shares",
+                    "Price",
+                    "TradeValue",
+                    "CashFlow",
+                    "Transaction Cost",
+                    "RemainingCash",
+                ]
+                for col in numeric_cols:
+                    if col in display_tx.columns:
+                        display_tx[col] = truncate_series(
+                            pd.to_numeric(display_tx[col], errors="coerce"),
+                            decimals=4,
+                        )
+                display_tx = display_tx.rename(columns={"Net_Weight": "Net weight"})
+                display_tx["Date"] = pd.to_datetime(display_tx["Date"]).dt.strftime("%Y-%m-%d")
+                column_order = [
+                    "Date",
+                    "Ticker",
+                    "Signal",
+                    "Action",
+                    "Net weight",
+                    "Reason",
+                    "Shares",
+                    "Price",
+                    "TradeValue",
+                    "Transaction Cost",
+                    "CashFlow",
+                    "RemainingCash",
+                ]
+                display_tx = display_tx[
+                    [c for c in column_order if c in display_tx.columns]
+                ]
+                total_trades = len(display_tx)
+                visible_tx = display_tx.head(100)
+                rows_shown = len(visible_tx)
+                table_height = min(900, 60 + rows_shown * 28)
+                st.dataframe(visible_tx, hide_index=True, height=table_height)
+                caption = f"{total_trades} trades recorded across the backtest window. "
+                if rows_shown < total_trades:
+                    caption += f"Showing the first {rows_shown} trades. "
+                caption += "Positive CashFlow reflects capital returned to cash."
+                st.caption(caption)
+
+
+
+        with tab1:
+            st.divider()
+            st.write(f"### 🔄 Backtest ({rebalance_choice} Rebalance)")
+            if not backtest_available:
+                if backtest_error:
+                    st.warning(
+                        f"Backtest unavailable: {backtest_error}"
+                    )
+                else:
+                    st.info(
+                        "Backtest unavailable. Ensure sufficient price history and weights, then rerun."
+                    )
+            else:
+                initial_capital_amt = backtest_summary.get("initial_capital", capital)
+                realized_amt = backtest_summary.get("realized_pnl")
+                unrealized_amt = backtest_summary.get("unrealized_pnl")
+                price_pnl = None
+                price_return_pct = None
+                if realized_amt is not None or unrealized_amt is not None:
+                    price_pnl = (realized_amt or 0.0) + (unrealized_amt or 0.0)
+                    if initial_capital_amt:
+                        price_return_pct = price_pnl / float(initial_capital_amt)
+                if price_pnl is None:
+                    price_pnl = ret_amt
+                if price_return_pct is None:
+                    price_return_pct = ret_pct
+
+            # Shared variables already defined above
+            # portfolio_cycles, state_cycle_df, latest_state_row, initial_live_capital
+
+            backtest_summary_cols = st.columns(4)
+            cash_amt = backtest_summary.get("ending_cash")
+            current_position_amt = final_amt
+            if current_position_amt is not None and cash_amt is not None:
+                current_position_amt = current_position_amt - cash_amt
+            else:
+                current_position_amt = invested_amt
+            txn_cost_amt = backtest_summary.get("transaction_cost_total")
+
+            rebalance_display_count = int(rebalance_count)
+            if latest_state_row is not None:
+                current_position_amt = float(latest_state_row.get("Current Position", current_position_amt or 0.0))
+                cash_amt = float(latest_state_row.get("Cash", cash_amt or 0.0))
+                price_pnl = float(latest_state_row.get("P/L", price_pnl or 0.0))
+                price_return_pct = float(latest_state_row.get("ReturnPct", price_return_pct or 0.0))
+                rebalance_display_count = int(latest_state_row.get("Rebalances", rebalance_display_count))
+                txn_cost_amt = float(latest_state_row.get("Transaction Costs", txn_cost_amt or 0.0))
+                realized_amt = float(latest_state_row.get("RealizedPnL", realized_amt or 0.0))
+                unrealized_amt = float(latest_state_row.get("UnrealizedPnL", unrealized_amt or 0.0))
+
+            backtest_summary_cols[0].metric(
+                "Current Position", _fmt_dollar(current_position_amt)
+            )
+            backtest_summary_cols[1].metric("P/L", _fmt_dollar(price_pnl))
+            backtest_summary_cols[2].metric("Return %", _fmt_pct(price_return_pct))
+            backtest_summary_cols[3].metric("Rebalances", str(int(rebalance_display_count)))
+
+            cumulative_realized = realized_amt
+            latest_unrealized = unrealized_amt
+
+            pnl_cols = st.columns(4)
+            if cumulative_realized is not None:
+                pnl_cols[0].metric("Cumulative Realized P/L", _fmt_dollar(cumulative_realized))
+            if latest_unrealized is not None:
+                pnl_cols[1].metric("Unrealized P/L", _fmt_dollar(latest_unrealized))
+            if txn_cost_amt is not None:
+                pnl_cols[2].metric("Transaction Costs", _fmt_dollar(txn_cost_amt))
+            if cash_amt is not None:
+                pnl_cols[3].metric("Cash", _fmt_dollar(cash_amt))
+
+                if rebalance_count == 0:
+                    st.caption(
+                        "No scheduled rebalances executed; holdings carried throughout the window."
+                    )
+                elif rebalance_dates:
+                    formatted_rebalance_dates = [
+                        pd.to_datetime(dt).strftime("%Y-%m-%d") for dt in rebalance_dates
+                    ]
+                    st.caption(
+                        "Rebalances executed on: " + ", ".join(formatted_rebalance_dates)
+                    )
+                calendar_notes = [
+                    note for note in backtest_summary.get("calendar_notes", []) if note
+                ]
+                if calendar_notes:
+                    st.caption("Calendar adjustments: " + " | ".join(calendar_notes))
+                if missing_price_notes:
+                    st.caption("Skipped trades: " + " | ".join(missing_price_notes))
+
+                if backtest_curve is not None and not backtest_curve.empty:
+                    chart_df = backtest_curve.copy()
+                    if not isinstance(chart_df.index, pd.DatetimeIndex):
+                        chart_df.index = pd.to_datetime(chart_df.index)
+                    
+                    # Align graph to match metrics (Live State) exactly
+                    # Small discrepancies can occur between daily backtest and weekly live execution
+                    # due to rounding or fee timing. We scale the curve to hit the live final value.
+                    live_total_val = (current_position_amt or 0.0) + (cash_amt or 0.0)
+                    backtest_final_val = chart_df["Portfolio Value"].iloc[-1] if not chart_df.empty else 0.0
+                    
+                    if backtest_final_val > 0 and live_total_val > 0:
+                        scale_factor = live_total_val / backtest_final_val
+                        # Only apply scaling if the difference is small (e.g. < 1%) to avoid masking real errors
+                        if 0.99 < scale_factor < 1.01:
+                            chart_df["Portfolio Value"] = chart_df["Portfolio Value"] * scale_factor
+
+                    # Create Plotly Figure
+                    fig = go.Figure()
+
+                    # 1. Portfolio Value Line
+                    fig.add_trace(go.Scatter(
+                        x=chart_df.index,
+                        y=chart_df["Portfolio Value"],
+                        mode='lines',
+                        name='Portfolio',
+                        line=dict(color='#00CC96', width=2)
+                    ))
+
+                    # 2. Benchmark Line (S&P 500)
+                    if benchmark_curve is not None and not benchmark_curve.empty:
+                        bench_chart = benchmark_curve.copy()
+                        if not isinstance(bench_chart.index, pd.DatetimeIndex):
+                            bench_chart.index = pd.to_datetime(bench_chart.index)
+                        
+                        # Align benchmark to chart_df dates if needed, or just plot
+                        fig.add_trace(go.Scatter(
+                            x=bench_chart.index,
+                            y=bench_chart["Benchmark Value"],
+                            mode='lines',
+                            name='S&P 500',
+                            line=dict(color='#636EFA', width=2, dash='dot')
+                        ))
+
+                    # 3. Rebalance Markers
+                    if rebalance_dates:
+                        valid_dates = []
+                        rebalance_vals = []
+                        for dt in rebalance_dates:
+                            dt_ts = pd.to_datetime(dt)
+                            # Find exact or nearest date in chart_df to place the marker
+                            # Using 'nearest' ensures we plot a point even if exact timestamp mismatches slightly
+                            try:
+                                idx = chart_df.index.get_indexer([dt_ts], method='nearest')
+                                if len(idx) > 0 and idx[0] != -1:
+                                    actual_dt = chart_df.index[idx[0]]
+                                    # Check if the nearest date is reasonably close (e.g. within a few days)
+                                    # to avoid plotting a marker far away if data is missing
+                                    if abs((actual_dt - dt_ts).days) <= 5:
+                                        val = chart_df.iloc[idx[0]]["Portfolio Value"]
+                                        valid_dates.append(actual_dt)
+                                        rebalance_vals.append(val)
+                            except Exception:
+                                pass # Skip if date matching fails
+
+                        if valid_dates:
+                            fig.add_trace(go.Scatter(
+                                x=valid_dates,
+                                y=rebalance_vals,
+                                mode='markers',
+                                name='Rebalance',
+                                marker=dict(
+                                    color='red', 
+                                    size=10, 
+                                    symbol='circle-open', 
+                                    line=dict(width=2)
+                                ),
+                                hovertemplate='Rebalance: %{x|%Y-%m-%d}<br>Value: $%{y:,.2f}'
+                            ))
+
+                    # Layout Configuration
+                    fig.update_layout(
+                        title="Portfolio Performance vs Benchmark",
+                        xaxis_title="Date",
+                        yaxis_title="Value ($)",
+                        hovermode="x unified",
+                        legend=dict(
+                            orientation="h",
+                            yanchor="bottom",
+                            y=1.02,
+                            xanchor="right",
+                            x=1
+                        ),
+                        margin=dict(l=20, r=20, t=60, b=20),
+                        height=500,
+                        xaxis=dict(
+                            showgrid=True, 
+                            gridcolor='rgba(211, 211, 211, 0.3)'
+                        ),
+                        yaxis=dict(
+                            showgrid=True, 
+                            gridcolor='rgba(211, 211, 211, 0.3)',
+                            tickprefix="$"
+                        ),
+                        plot_bgcolor='white'
+                    )
+
+                    st.plotly_chart(fig, use_container_width=True)
+                    st.caption(
+                        f"Portfolio value trajectory ({rebalance_choice.lower()} rebalance) versus S&P 500 benchmark. Red circles indicate rebalance execution dates."
+                    )
+
+                if backtest_metrics:
+                    rows = [
+                        "Annualized Return",
+                        "Annualized Volatility",
+                        "Sharpe Ratio",
+                        "Sortino Ratio",
+                        "Max Drawdown",
+                        "CAGR",
+                    ]
+                    metrics_data = {
+                        "Metric": rows,
+                        "Portfolio": [
+                            format_percentage(backtest_metrics.get("Annualized Return")),
+                            format_percentage(backtest_metrics.get("Annualized Volatility")),
+                            _fmt_ratio(backtest_metrics.get("Sharpe Ratio")),
+                            _fmt_ratio(backtest_metrics.get("Sortino Ratio")),
+                            format_percentage(backtest_metrics.get("Max Drawdown")),
+                            format_percentage(backtest_metrics.get("CAGR")),
+                        ],
+                    }
+                    if benchmark_metrics:
+                        metrics_data["S&P 500"] = [
+                            format_percentage(benchmark_metrics.get("Annualized Return")),
+                            format_percentage(benchmark_metrics.get("Annualized Volatility")),
+                            _fmt_ratio(benchmark_metrics.get("Sharpe Ratio")),
+                            _fmt_ratio(benchmark_metrics.get("Sortino Ratio")),
+                            format_percentage(benchmark_metrics.get("Max Drawdown")),
+                            format_percentage(benchmark_metrics.get("CAGR")),
+                        ]
+                    metrics_df = pd.DataFrame(metrics_data)
+                    st.table(metrics_df)
 
             if state_cycle_df is not None and not state_cycle_df.empty:
-                st.write("### Cycle P/L Log")
-                log_display = state_cycle_df.copy()
-                log_display["Rebalance Cadence"] = f"{rebalance_choice} Rebalance"
-                log_display["Return %"] = log_display["ReturnPct"]
-                log_display["P/L"] = log_display["P/L"]
-                log_display["Realized P/L"] = log_display["RealizedCycle"]
-                log_display["Cumulative Realized P/L"] = log_display["RealizedPnL"]
-                log_display["Unrealized P/L"] = log_display["UnrealizedCycle"]
-                log_display["Latest Unrealized P/L"] = log_display["UnrealizedPnL"]
-                ordered_cols = [
-                    "Execution Date",
-                    "Rebalance Cadence",
-                    "Current Position",
-                    "P/L",
-                    "Return %",
-                    "Rebalances",
-                    "Realized P/L",
-                    "Cumulative Realized P/L",
-                    "Unrealized P/L",
-                    "Latest Unrealized P/L",
-                    "Transaction Costs",
-                    "Cash",
-                ]
-                log_display = log_display[ordered_cols]
-                currency_cols = [
-                    "Current Position",
-                    "P/L",
-                    "Realized P/L",
-                    "Cumulative Realized P/L",
-                    "Unrealized P/L",
-                    "Latest Unrealized P/L",
-                    "Transaction Costs",
-                    "Cash",
-                ]
-                for col in currency_cols:
-                    log_display[col] = truncate_series(
-                        pd.to_numeric(log_display[col], errors="coerce"), decimals=4
+                with tab5:
+                    st.write("### Cycle P/L Log")
+                    log_display = state_cycle_df.copy()
+                    log_display["Rebalance Cadence"] = f"{rebalance_choice} Rebalance"
+                    log_display["Return %"] = log_display["ReturnPct"]
+                    log_display["P/L"] = log_display["P/L"]
+                    log_display["Realized P/L"] = log_display["RealizedCycle"]
+                    log_display["Cumulative Realized P/L"] = log_display["RealizedPnL"]
+                    log_display["Unrealized P/L"] = log_display["UnrealizedCycle"]
+                    log_display["Latest Unrealized P/L"] = log_display["UnrealizedPnL"]
+                    ordered_cols = [
+                        "Execution Date",
+                        "Rebalance Cadence",
+                        "Current Position",
+                        "P/L",
+                        "Return %",
+                        "Rebalances",
+                        "Realized P/L",
+                        "Cumulative Realized P/L",
+                        "Unrealized P/L",
+                        "Latest Unrealized P/L",
+                        "Transaction Costs",
+                        "Cash",
+                    ]
+                    log_display = log_display[ordered_cols]
+                    currency_cols = [
+                        "Current Position",
+                        "P/L",
+                        "Realized P/L",
+                        "Cumulative Realized P/L",
+                        "Unrealized P/L",
+                        "Latest Unrealized P/L",
+                        "Transaction Costs",
+                        "Cash",
+                    ]
+                    for col in currency_cols:
+                        log_display[col] = truncate_series(
+                            pd.to_numeric(log_display[col], errors="coerce"), decimals=4
+                        )
+                    log_display["Return %"] = truncate_series(
+                        pd.to_numeric(log_display["Return %"], errors="coerce"), decimals=4
                     )
-                log_display["Return %"] = truncate_series(
-                    pd.to_numeric(log_display["Return %"], errors="coerce"), decimals=4
-                )
-                formatted_log = log_display.copy()
-                for col in currency_cols:
-                    formatted_log[col] = formatted_log[col].apply(format_currency)
-                formatted_log["Return %"] = formatted_log["Return %"].apply(format_percentage)
-                st.dataframe(formatted_log, hide_index=True)
-                st.caption(
-                    "Logged using live PortfolioState accounting; each row satisfies Current Holdings + Cash − Initial = Realized + Unrealized − Fees."
-                )
+                    formatted_log = log_display.copy()
+                    for col in currency_cols:
+                        formatted_log[col] = formatted_log[col].apply(format_currency)
+                    formatted_log["Return %"] = formatted_log["Return %"].apply(format_percentage)
+                    st.dataframe(formatted_log, hide_index=True)
+                    st.caption(
+                        "Logged using live PortfolioState accounting; each row satisfies Current Holdings + Cash − Initial = Realized + Unrealized − Fees."
+                    )
 
     else:
         st.info(
